@@ -14,6 +14,13 @@ def get_config():
         "model_basename": "tmodel_",
         "preload": "latest",
         
+        # Early stopping parameters
+        "early_stopping": True,  # Whether to use early stopping
+        "early_stopping_patience": 10,  # Number of epochs with no improvement to stop training
+        "early_stopping_metric": "bleu",  # Metric to monitor: 'bleu', 'wer', 'cer', or 'loss'
+        "early_stopping_min_delta": 0.0001,  # Minimum change to be considered as improvement
+        "save_best_model": True,  # Whether to save the best model
+        
         # Paths to the tokenizer models
         "tokenizer_src_path": "kaggle/working/tokenizer_vi.model",  # Path to Vietnamese tokenizer
         "tokenizer_tgt_path": "kaggle/working/tokenizer_lo.model",  # Path to Lao tokenizer

@@ -97,6 +97,9 @@ def run_validation(model, validation_ds, tokenizer_src, tokenizer_tgt, max_len, 
                 print_msg('-'*console_width)
                 break
     
+    # Initialize metrics
+    metrics = {}
+    
     if writer:
         # Evaluate the character error rate
         # Compute the char error rate 
@@ -104,18 +107,23 @@ def run_validation(model, validation_ds, tokenizer_src, tokenizer_tgt, max_len, 
         cer = metric(predicted, expected)
         writer.add_scalar('validation cer', cer, global_step)
         writer.flush()
+        metrics['cer'] = cer.item()
 
         # Compute the word error rate
         metric = torchmetrics.WordErrorRate()
         wer = metric(predicted, expected)
         writer.add_scalar('validation wer', wer, global_step)
         writer.flush()
+        metrics['wer'] = wer.item()
 
         # Compute the BLEU metric
         metric = torchmetrics.BLEUScore()
         bleu = metric(predicted, expected)
         writer.add_scalar('validation BLEU', bleu, global_step)
         writer.flush()
+        metrics['bleu'] = bleu.item()
+    
+    return metrics
 
 def get_ds(config):
     # Load tokenizers using SentencePiece
@@ -226,12 +234,28 @@ def train_model(config):
     pad_idx = tokenizer_src.piece_to_id("<pad>")
     loss_fn = nn.CrossEntropyLoss(ignore_index=pad_idx, label_smoothing=0.1).to(device)
 
+    # Early stopping setup
+    early_stopping_enabled = config.get('early_stopping', False)
+    best_metric_value = float('-inf') if config.get('early_stopping_metric', 'bleu') in ['bleu'] else float('inf')
+    patience_counter = 0
+    best_model_filename = None
+    
+    print(f"Early stopping: {'enabled' if early_stopping_enabled else 'disabled'}")
+    if early_stopping_enabled:
+        print(f"Monitoring metric: {config.get('early_stopping_metric', 'bleu')}")
+        print(f"Patience: {config.get('early_stopping_patience', 3)} epochs")
+        
     for epoch in range(initial_epoch, config['num_epochs']):
         torch.cuda.empty_cache()
         model.train()
         batch_iterator = tqdm(train_dataloader, desc=f"Processing Epoch {epoch:02d}")
+        
+        # Training loss for this epoch
+        total_loss = 0.0
+        batch_count = 0
+        
         for batch in batch_iterator:
-
+            batch_count += 1
             encoder_input = batch['encoder_input'].to(device) # (b, seq_len)
             decoder_input = batch['decoder_input'].to(device) # (B, seq_len)
             encoder_mask = batch['encoder_mask'].to(device) # (B, 1, 1, seq_len)
@@ -248,6 +272,9 @@ def train_model(config):
             # Compute the loss using a simple cross entropy
             loss = loss_fn(proj_output.view(-1, tokenizer_tgt.vocab_size()), label.view(-1))
             batch_iterator.set_postfix({"loss": f"{loss.item():6.3f}"})
+            
+            # Accumulate the loss
+            total_loss += loss.item()
 
             # Log the loss
             writer.add_scalar('train loss', loss.item(), global_step)
@@ -262,8 +289,15 @@ def train_model(config):
 
             global_step += 1
 
+        # Calculate average training loss for this epoch
+        avg_train_loss = total_loss / batch_count
+        print(f"Epoch {epoch:02d} - Average training loss: {avg_train_loss:.4f}")
+        writer.add_scalar('average train loss', avg_train_loss, epoch)
+        writer.flush()
+
         # Run validation at the end of every epoch
-        run_validation(model, val_dataloader, tokenizer_src, tokenizer_tgt, config['seq_len'], device, lambda msg: batch_iterator.write(msg), global_step, writer)
+        max_len_val = config.get('max_len', 500)  # Use the same max_len from config or a reasonable default
+        metrics = run_validation(model, val_dataloader, tokenizer_src, tokenizer_tgt, max_len_val, device, lambda msg: batch_iterator.write(msg), global_step, writer)
 
         # Save the model at the end of every epoch
         model_filename = get_weights_file_path(config, f"{epoch:02d}")
@@ -271,8 +305,55 @@ def train_model(config):
             'epoch': epoch,
             'model_state_dict': model.state_dict(),
             'optimizer_state_dict': optimizer.state_dict(),
-            'global_step': global_step
+            'global_step': global_step,
+            'metrics': metrics
         }, model_filename)
+        
+        # Early stopping logic
+        if early_stopping_enabled and metrics:
+            # Get the value of the monitored metric
+            monitored_metric = config.get('early_stopping_metric', 'bleu')
+            current_metric_value = metrics.get(monitored_metric)
+            
+            if current_metric_value is not None:
+                # Check if this is a new best model
+                is_improvement = False
+                
+                # For metrics where higher is better (like BLEU)
+                if monitored_metric in ['bleu']:
+                    is_improvement = current_metric_value > (best_metric_value + config.get('early_stopping_min_delta', 0.0001))
+                # For metrics where lower is better (like loss, WER, CER)
+                else:
+                    is_improvement = current_metric_value < (best_metric_value - config.get('early_stopping_min_delta', 0.0001))
+                
+                if is_improvement:
+                    print(f"Validation {monitored_metric} improved from {best_metric_value:.6f} to {current_metric_value:.6f}")
+                    best_metric_value = current_metric_value
+                    patience_counter = 0
+                    
+                    # Save the best model if configured
+                    if config.get('save_best_model', True):
+                        best_model_filename = get_weights_file_path(config, "best")
+                        torch.save({
+                            'epoch': epoch,
+                            'model_state_dict': model.state_dict(),
+                            'optimizer_state_dict': optimizer.state_dict(),
+                            'global_step': global_step,
+                            'metrics': metrics
+                        }, best_model_filename)
+                        print(f"Saved new best model to {best_model_filename}")
+                else:
+                    patience_counter += 1
+                    print(f"Validation {monitored_metric} did not improve. Patience: {patience_counter}/{config.get('early_stopping_patience', 3)}")
+                    
+                    if patience_counter >= config.get('early_stopping_patience', 3):
+                        print(f"Early stopping triggered! No improvement for {patience_counter} epochs.")
+                        break
+
+    print("Training completed!")
+    if early_stopping_enabled and best_model_filename and os.path.exists(best_model_filename):
+        print(f"Best model saved at: {best_model_filename}")
+        print(f"Best validation {config.get('early_stopping_metric', 'bleu')}: {best_metric_value:.6f}")
 
 
 if __name__ == '__main__':
