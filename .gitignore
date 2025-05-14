@@ -1,0 +1,11 @@
+__pycache__
+*.pt
+*.json
+runs/
+weights/
+
+wandb/
+
+venv/
+VLSP2023/
+kaggle/
