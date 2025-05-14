@@ -302,6 +302,17 @@ def get_model(config, vocab_src_len, vocab_tgt_len, device=None):
         
     return model
 
+def get_autocast_context(use_mixed_precision=False):
+    """Helper function to get the right autocast context manager"""
+    # Import only if needed
+    if use_mixed_precision:
+        from torch.amp import autocast
+        return autocast(device_type='cuda')
+    else:
+        # Return a dummy context manager that does nothing
+        from contextlib import nullcontext
+        return nullcontext()
+
 def train_model_distributed(rank, world_size, config):
     """
     Train the model in distributed mode.
@@ -423,10 +434,18 @@ def train_model_distributed(rank, world_size, config):
 
     # Mixed precision setup
     use_mixed_precision = config.get('use_mixed_precision', True) and device.type == 'cuda'
-    scaler = torch.cuda.amp.GradScaler() if use_mixed_precision else None
     
-    if rank == 0 and use_mixed_precision:
-        print("Using mixed precision training")
+    # Set up autocast and GradScaler for mixed precision
+    if use_mixed_precision:
+        from torch.amp import autocast, GradScaler
+        amp_context = autocast(device_type='cuda')
+        scaler = GradScaler()
+        if rank == 0:
+            print("Using mixed precision training")
+    else:
+        from contextlib import nullcontext
+        amp_context = nullcontext()
+        scaler = None
 
     # Early stopping setup (only track on main process)
     early_stopping_enabled = config.get('early_stopping', False)
@@ -488,61 +507,43 @@ def train_model_distributed(rank, world_size, config):
             # Normalize loss by grad_accum_steps
             loss_factor = 1.0 / grad_accum_steps
 
-            # Use mixed precision if enabled
-            if use_mixed_precision:
-                with torch.cuda.amp.autocast():
-                    encoder_output = model.module.encode(encoder_input, encoder_mask)
-                    decoder_output = model.module.decode(encoder_output, encoder_mask, decoder_input, decoder_mask)
-                    proj_output = model.module.project(decoder_output)
-                    
-                    # Compute loss
-                    loss = loss_fn(proj_output.view(-1, tokenizer_tgt.vocab_size()), label.view(-1)) * loss_factor
-                
-                # Backpropagate with gradient scaling
-                scaler.scale(loss).backward()
-                
-                # Update weights if we reached the accumulation steps
-                if (i + 1) % grad_accum_steps == 0 or (i + 1) == len(train_dataloader):
-                    # Unscale gradients for clipping
-                    scaler.unscale_(optimizer)
-                    
-                    # Gradient clipping
-                    torch.nn.utils.clip_grad_norm_(model.parameters(), config.get('gradient_clip_val', 1.0))
-                    
-                    # Update weights with scaled gradients
-                    scaler.step(optimizer)
-                    scaler.update()
-                    
-                    # Update learning rate
-                    scheduler.step()
-                    
-                    # Reset gradients
-                    optimizer.zero_grad(set_to_none=True)
-            else:
-                # Standard training without mixed precision
+            # Forward pass with autocast for mixed precision
+            with amp_context:
                 encoder_output = model.module.encode(encoder_input, encoder_mask)
                 decoder_output = model.module.decode(encoder_output, encoder_mask, decoder_input, decoder_mask)
                 proj_output = model.module.project(decoder_output)
                 
-                # Compute loss with gradient accumulation
+                # Compute loss
                 loss = loss_fn(proj_output.view(-1, tokenizer_tgt.vocab_size()), label.view(-1)) * loss_factor
-                
-                # Backpropagate
+            
+            # Backward pass with gradient scaling if using mixed precision
+            if use_mixed_precision:
+                scaler.scale(loss).backward()
+            else:
                 loss.backward()
-                
-                # Update weights if we reached the accumulation steps
-                if (i + 1) % grad_accum_steps == 0 or (i + 1) == len(train_dataloader):
-                    # Gradient clipping
-                    torch.nn.utils.clip_grad_norm_(model.parameters(), config.get('gradient_clip_val', 1.0))
+            
+            # Update weights if we reached the accumulation steps
+            if (i + 1) % grad_accum_steps == 0 or (i + 1) == len(train_dataloader):
+                if use_mixed_precision:
+                    # Unscale gradients for clipping
+                    scaler.unscale_(optimizer)
                     
+                # Gradient clipping
+                torch.nn.utils.clip_grad_norm_(model.parameters(), config.get('gradient_clip_val', 1.0))
+                
+                if use_mixed_precision:
+                    # Update weights with scaled gradients
+                    scaler.step(optimizer)
+                    scaler.update()
+                else:
                     # Update weights
                     optimizer.step()
-                    
-                    # Update learning rate
-                    scheduler.step()
-                    
-                    # Reset gradients
-                    optimizer.zero_grad(set_to_none=True)
+                
+                # Update learning rate
+                scheduler.step()
+                
+                # Reset gradients
+                optimizer.zero_grad(set_to_none=True)
             
             # Accumulate full loss for logging (not the scaled loss)
             full_loss = loss.item() * grad_accum_steps

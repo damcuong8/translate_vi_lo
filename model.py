@@ -111,8 +111,14 @@ class MultiHeadAttentionBlock(nn.Module):
                 # Handle the case where mask is [batch, 1, 1, seq_len] or [batch, 1, seq_len, seq_len]
                 # Expand mask to have same number of heads as attention_scores
                 mask = mask.expand(-1, attention_scores.size(1), -1, -1)
+            
+            # Use a safer value for FP16 (-1e4 instead of -1e9)
+            # This value is still large enough to create an effective mask but safe for FP16
+            float_min_value = torch.finfo(attention_scores.dtype).min
+            mask_fill_value = max(-1e4, float_min_value/2)
+            
             # Write a very low value (indicating -inf) to the positions where mask == 0
-            attention_scores.masked_fill_(mask == 0, -1e9)
+            attention_scores.masked_fill_(mask == 0, mask_fill_value)
         attention_scores = attention_scores.softmax(dim=-1) # (batch, h, seq_len, seq_len) # Apply softmax
         if dropout is not None:
             attention_scores = dropout(attention_scores)
