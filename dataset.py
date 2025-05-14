@@ -49,8 +49,10 @@ class BilingualDataset(Dataset):
         }
     
 def causal_mask(size):
-    mask = torch.triu(torch.ones((1, size, size)), diagonal=1).type(torch.int)
-    return mask == 0
+    # Create a causal mask of shape [1, size, size]
+    # The mask is 1 where attention is allowed, 0 where it is not
+    mask = torch.triu(torch.ones((size, size)), diagonal=1).type(torch.int)
+    return (mask == 0).unsqueeze(0)  # [1, size, size], True where allowed
 
 def collate_batch(batch, tokenizer_src, tokenizer_tgt):
     # Get special token IDs
@@ -104,8 +106,17 @@ def collate_batch(batch, tokenizer_src, tokenizer_tgt):
         labels[i, tgt_length-1] = eos_token_tgt
     
     # Create decoder masks (combining padding mask with causal mask)
-    decoder_padding_masks = (decoder_inputs != pad_token_tgt).unsqueeze(1).int()
-    decoder_masks = decoder_padding_masks & causal_mask(max_tgt_len)
+    decoder_padding_masks = (decoder_inputs != pad_token_tgt).unsqueeze(1).int()  # [batch, 1, tgt_len]
+    causal_masks = causal_mask(max_tgt_len)  # [1, tgt_len, tgt_len]
+    
+    # Combine padding mask with causal mask to get final decoder mask
+    # decoder_padding_masks: [batch, 1, tgt_len] -> [batch, 1, 1, tgt_len]
+    # causal_masks: [1, tgt_len, tgt_len] -> [1, 1, tgt_len, tgt_len]
+    decoder_padding_masks = decoder_padding_masks.unsqueeze(1)  # [batch, 1, 1, tgt_len]
+    causal_masks = causal_masks.unsqueeze(0)  # [1, 1, tgt_len, tgt_len]
+    
+    # Broadcasting: [batch, 1, 1, tgt_len] & [1, 1, tgt_len, tgt_len] -> [batch, 1, tgt_len, tgt_len]
+    decoder_masks = decoder_padding_masks & causal_masks
     
     return {
         "encoder_input": encoder_inputs,

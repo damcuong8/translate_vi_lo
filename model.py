@@ -103,6 +103,13 @@ class MultiHeadAttentionBlock(nn.Module):
         # (batch, h, seq_len, d_k) --> (batch, h, seq_len, seq_len)
         attention_scores = (query @ key.transpose(-2, -1)) / math.sqrt(d_k)
         if mask is not None:
+            # Make sure mask has right shape for broadcasting
+            # If mask is (batch, 1, 1, seq_len), we need to adjust it for multi-head
+            # Or if mask is (batch, 1, seq_len, seq_len), expand it for multi-head
+            if len(mask.shape) == 4 and mask.shape[1] == 1:
+                # Handle the case where mask is [batch, 1, 1, seq_len] or [batch, 1, seq_len, seq_len]
+                # Expand mask to have same number of heads as attention_scores
+                mask = mask.expand(-1, attention_scores.size(1), -1, -1)
             # Write a very low value (indicating -inf) to the positions where mask == 0
             attention_scores.masked_fill_(mask == 0, -1e9)
         attention_scores = attention_scores.softmax(dim=-1) # (batch, h, seq_len, seq_len) # Apply softmax
