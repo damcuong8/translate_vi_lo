@@ -7,6 +7,7 @@ import torch.nn as nn
 from torch.utils.data import Dataset, DataLoader, random_split
 from torch.optim.lr_scheduler import LambdaLR
 import functools
+import math
 
 import warnings
 from tqdm import tqdm
@@ -16,7 +17,9 @@ from pathlib import Path
 # SentencePiece for tokenization
 import sentencepiece as spm
 
-import torchmetrics
+# Import metrics from torchmetrics.text instead of torchmetrics directly
+from torchmetrics.text import CharErrorRate, WordErrorRate, BLEUScore
+
 from torch.utils.tensorboard import SummaryWriter
 
 def greedy_decode(model, source, source_mask, tokenizer_src, tokenizer_tgt, max_len, device):
@@ -50,13 +53,17 @@ def greedy_decode(model, source, source_mask, tokenizer_src, tokenizer_tgt, max_
     return decoder_input.squeeze(0)
 
 
-def run_validation(model, validation_ds, tokenizer_src, tokenizer_tgt, max_len, device, print_msg, global_step, writer, num_examples=2):
+def run_validation(model, validation_ds, tokenizer_src, tokenizer_tgt, max_len, device, print_msg, global_step, writer, num_examples=16, num_display=2):
     model.eval()
     count = 0
 
     source_texts = []
     expected = []
     predicted = []
+    
+    # For proper BLEU calculation
+    tokenized_expected = []
+    tokenized_predicted = []
 
     try:
         # get the console window width
@@ -87,13 +94,22 @@ def run_validation(model, validation_ds, tokenizer_src, tokenizer_tgt, max_len, 
             expected.append(target_text)
             predicted.append(model_out_text)
             
-            # Print the source, target and model output
-            print_msg('-'*console_width)
-            print_msg(f"{f'SOURCE: ':>12}{source_text}")
-            print_msg(f"{f'TARGET: ':>12}{target_text}")
-            print_msg(f"{f'PREDICTED: ':>12}{model_out_text}")
+            # Tokenize for BLEU score calculation
+            # Split text into words for BLEU (simple whitespace tokenization for demo)
+            tokenized_expected.append(target_text.split())
+            tokenized_predicted.append(model_out_text.split())
+            
+            # Print only the first few examples
+            if count <= num_display:
+                print_msg('-'*console_width)
+                print_msg(f"{f'SOURCE: ':>12}{source_text}")
+                print_msg(f"{f'TARGET: ':>12}{target_text}")
+                print_msg(f"{f'PREDICTED: ':>12}{model_out_text}")
 
             if count == num_examples:
+                if count > num_display:
+                    print_msg('-'*console_width)
+                    print_msg(f"... {count - num_display} more examples evaluated but not displayed ...")
                 print_msg('-'*console_width)
                 break
     
@@ -103,25 +119,45 @@ def run_validation(model, validation_ds, tokenizer_src, tokenizer_tgt, max_len, 
     if writer:
         # Evaluate the character error rate
         # Compute the char error rate 
-        metric = torchmetrics.CharErrorRate()
+        metric = CharErrorRate()
         cer = metric(predicted, expected)
         writer.add_scalar('validation cer', cer, global_step)
         writer.flush()
         metrics['cer'] = cer.item()
 
         # Compute the word error rate
-        metric = torchmetrics.WordErrorRate()
+        metric = WordErrorRate()
         wer = metric(predicted, expected)
         writer.add_scalar('validation wer', wer, global_step)
         writer.flush()
         metrics['wer'] = wer.item()
 
-        # Compute the BLEU metric
-        metric = torchmetrics.BLEUScore()
-        bleu = metric(predicted, expected)
-        writer.add_scalar('validation BLEU', bleu, global_step)
-        writer.flush()
-        metrics['bleu'] = bleu.item()
+        # Compute the BLEU metric with properly tokenized input
+        try:
+            # First try with the new tokenized input
+            bleu_metric = BLEUScore()
+            bleu = bleu_metric(tokenized_predicted, tokenized_expected)
+            
+            # Print debug info
+            print_msg(f"BLEU score: {bleu.item():.4f}")
+            print_msg(f"Example reference: {tokenized_expected[0][:10]}")
+            print_msg(f"Example hypothesis: {tokenized_predicted[0][:10]}")
+            
+            writer.add_scalar('validation BLEU', bleu, global_step)
+            writer.flush()
+            metrics['bleu'] = bleu.item()
+        except Exception as e:
+            print_msg(f"Error calculating BLEU score: {str(e)}")
+            # As a fallback, try calculating with full strings
+            try:
+                bleu_metric = BLEUScore()
+                bleu = bleu_metric(predicted, expected)
+                writer.add_scalar('validation BLEU', bleu, global_step)
+                writer.flush()
+                metrics['bleu'] = bleu.item()
+            except Exception as e2:
+                print_msg(f"Fallback BLEU calculation also failed: {str(e2)}")
+                metrics['bleu'] = 0.0
     
     return metrics
 
@@ -131,13 +167,18 @@ def get_ds(config):
     tokenizer_src.load(config['tokenizer_src_path'])
     tokenizer_tgt.load(config['tokenizer_tgt_path'])
     
+    # Get word dropout rate from config
+    word_dropout_rate = config.get('word_dropout_rate', 0.1)
+    
     # Define the train and validation datasets
     train_ds = BilingualDataset(
         config['train_src_file'],
         config['train_tgt_file'],
         tokenizer_src,
         tokenizer_tgt,
-        max_len=config.get('max_len', 500)  # Optional max length for filtering
+        max_len=config.get('max_len', 500),
+        word_dropout_rate=word_dropout_rate,
+        is_train=True
     )
     
     val_ds = BilingualDataset(
@@ -145,7 +186,9 @@ def get_ds(config):
         config['val_tgt_file'],
         tokenizer_src,
         tokenizer_tgt,
-        max_len=config.get('max_len', 500)  # Optional max length for filtering
+        max_len=config.get('max_len', 500),
+        word_dropout_rate=0.0,  # No word dropout for validation
+        is_train=False
     )
 
     # Create collate function with the tokenizers
@@ -185,9 +228,28 @@ def get_ds(config):
     return train_dataloader, val_dataloader, tokenizer_src, tokenizer_tgt
 
 def get_model(config, vocab_src_len, vocab_tgt_len):
-    # Use max_len instead of seq_len as the maximum sequence length
-    max_len = config.get("max_len", 500)
-    model = build_transformer(vocab_src_len, vocab_tgt_len, max_len, max_len, d_model=config['d_model'])
+    # Use config parameters for model construction
+    d_model = config.get('d_model', 384)
+    num_layers = config.get('num_layers', 4)
+    num_heads = config.get('num_heads', 8)
+    dropout = config.get('dropout', 0.15)
+    d_ff = config.get('d_ff', 1536)
+    
+    # Use max_len for maximum sequence length
+    max_len = config.get('max_len', 500)
+    
+    # Build transformer with specified parameters
+    model = build_transformer(
+        vocab_src_len, 
+        vocab_tgt_len, 
+        max_len, 
+        max_len, 
+        d_model=d_model,
+        N=num_layers,
+        h=num_heads,
+        dropout=dropout,
+        d_ff=d_ff
+    )
     return model
 
 def train_model(config):
@@ -209,11 +271,20 @@ def train_model(config):
     Path(f"{config['datasource']}_{config['model_folder']}").mkdir(parents=True, exist_ok=True)
 
     train_dataloader, val_dataloader, tokenizer_src, tokenizer_tgt = get_ds(config)
+    
+    # Initialize model with optimized parameters
     model = get_model(config, tokenizer_src.vocab_size(), tokenizer_tgt.vocab_size()).to(device)
+    
     # Tensorboard
     writer = SummaryWriter(config['experiment_name'])
 
-    optimizer = torch.optim.Adam(model.parameters(), lr=config['lr'], eps=1e-9)
+    # Use AdamW optimizer with weight decay
+    optimizer = torch.optim.AdamW(
+        model.parameters(), 
+        lr=config['lr'], 
+        eps=1e-9,
+        weight_decay=config.get('weight_decay', 0.01)
+    )
 
     # If the user specified a model to preload before training, load it
     initial_epoch = 0
@@ -230,9 +301,32 @@ def train_model(config):
     else:
         print('No model to preload, starting from scratch')
 
+    # Set up learning rate scheduler with warmup
+    total_steps = len(train_dataloader) * config['num_epochs']
+    warmup_steps = config.get('warmup_steps', 4000)
+    
+    def lr_lambda(step):
+        # Linear warmup followed by cosine decay
+        if step < warmup_steps:
+            return float(step) / float(max(1, warmup_steps))
+        # Cosine annealing after warmup
+        return 0.5 * (1.0 + math.cos(math.pi * (step - warmup_steps) / (total_steps - warmup_steps)))
+    
+    scheduler = LambdaLR(optimizer, lr_lambda)
+
     # SentencePiece uses piece_to_id instead of token_to_id
     pad_idx = tokenizer_src.piece_to_id("<pad>")
-    loss_fn = nn.CrossEntropyLoss(ignore_index=pad_idx, label_smoothing=0.1).to(device)
+    loss_fn = nn.CrossEntropyLoss(
+        ignore_index=pad_idx, 
+        label_smoothing=config.get('label_smoothing', 0.1)
+    ).to(device)
+
+    # Mixed precision setup
+    use_mixed_precision = config.get('use_mixed_precision', True) and device == 'cuda'
+    scaler = torch.cuda.amp.GradScaler() if use_mixed_precision else None
+    
+    if use_mixed_precision:
+        print("Using mixed precision training")
 
     # Early stopping setup
     early_stopping_enabled = config.get('early_stopping', False)
@@ -244,7 +338,8 @@ def train_model(config):
     if early_stopping_enabled:
         print(f"Monitoring metric: {config.get('early_stopping_metric', 'bleu')}")
         print(f"Patience: {config.get('early_stopping_patience', 3)} epochs")
-        
+    
+    # Training loop
     for epoch in range(initial_epoch, config['num_epochs']):
         torch.cuda.empty_cache()
         model.train()
@@ -260,34 +355,88 @@ def train_model(config):
             decoder_input = batch['decoder_input'].to(device) # (B, seq_len)
             encoder_mask = batch['encoder_mask'].to(device) # (B, 1, 1, seq_len)
             decoder_mask = batch['decoder_mask'].to(device) # (B, 1, seq_len, seq_len)
-
-            # Run the tensors through the encoder, decoder and the projection layer
-            encoder_output = model.encode(encoder_input, encoder_mask) # (B, seq_len, d_model)
-            decoder_output = model.decode(encoder_output, encoder_mask, decoder_input, decoder_mask) # (B, seq_len, d_model)
-            proj_output = model.project(decoder_output) # (B, seq_len, vocab_size)
-
-            # Compare the output with the label
             label = batch['label'].to(device) # (B, seq_len)
 
-            # Compute the loss using a simple cross entropy
-            loss = loss_fn(proj_output.view(-1, tokenizer_tgt.vocab_size()), label.view(-1))
-            batch_iterator.set_postfix({"loss": f"{loss.item():6.3f}"})
+            # Run the tensors through the encoder, decoder and the projection layer
+            # Use mixed precision if enabled
+            if use_mixed_precision:
+                with torch.cuda.amp.autocast():
+                    encoder_output = model.encode(encoder_input, encoder_mask)
+                    decoder_output = model.decode(encoder_output, encoder_mask, decoder_input, decoder_mask)
+                    proj_output = model.project(decoder_output)
+                    
+                    # Compute loss
+                    loss = loss_fn(proj_output.view(-1, tokenizer_tgt.vocab_size()), label.view(-1))
+                
+                # Backpropagate with gradient scaling
+                scaler.scale(loss).backward()
+                
+                # Gradient clipping
+                scaler.unscale_(optimizer)
+                torch.nn.utils.clip_grad_norm_(model.parameters(), config.get('gradient_clip_val', 1.0))
+                
+                # Update weights with scaled gradients
+                scaler.step(optimizer)
+                scaler.update()
+            else:
+                # Standard training without mixed precision
+                encoder_output = model.encode(encoder_input, encoder_mask)
+                decoder_output = model.decode(encoder_output, encoder_mask, decoder_input, decoder_mask)
+                proj_output = model.project(decoder_output)
+                
+                # Compute loss
+                loss = loss_fn(proj_output.view(-1, tokenizer_tgt.vocab_size()), label.view(-1))
+                
+                # Backpropagate
+                loss.backward()
+                
+                # Gradient clipping
+                torch.nn.utils.clip_grad_norm_(model.parameters(), config.get('gradient_clip_val', 1.0))
+                
+                # Update weights
+                optimizer.step()
+            
+            # Zero gradients
+            optimizer.zero_grad(set_to_none=True)
+            
+            # Update learning rate
+            scheduler.step()
+            
+            # Update progress
+            batch_iterator.set_postfix({
+                "loss": f"{loss.item():6.3f}",
+                "lr": f"{scheduler.get_last_lr()[0]:.1e}"
+            })
             
             # Accumulate the loss
             total_loss += loss.item()
 
             # Log the loss
             writer.add_scalar('train loss', loss.item(), global_step)
+            writer.add_scalar('learning rate', scheduler.get_last_lr()[0], global_step)
             writer.flush()
 
-            # Backpropagate the loss
-            loss.backward()
-
-            # Update the weights
-            optimizer.step()
-            optimizer.zero_grad(set_to_none=True)
-
             global_step += 1
+            
+            # Run validation if needed based on steps
+            if config.get('evaluation_strategy', 'epoch') == 'steps' and global_step % config.get('eval_steps', 1000) == 0:
+                max_len_val = config.get('max_len', 500)
+                metrics = run_validation(model, val_dataloader, tokenizer_src, tokenizer_tgt, max_len_val, device, 
+                                        lambda msg: batch_iterator.write(msg), global_step, writer)
+                model.train()  # Switch back to train mode after validation
+                
+                # Save model at checkpoint
+                if config.get('save_strategy', 'epoch') == 'steps' and global_step % config.get('save_steps', 1000) == 0:
+                    checkpoint_filename = get_weights_file_path(config, f"step_{global_step}")
+                    torch.save({
+                        'epoch': epoch,
+                        'global_step': global_step,
+                        'model_state_dict': model.state_dict(),
+                        'optimizer_state_dict': optimizer.state_dict(),
+                        'scheduler_state_dict': scheduler.state_dict() if scheduler else None,
+                        'metrics': metrics
+                    }, checkpoint_filename)
+                    print(f"Saved checkpoint at step {global_step} to {checkpoint_filename}")
 
         # Calculate average training loss for this epoch
         avg_train_loss = total_loss / batch_count
@@ -295,19 +444,24 @@ def train_model(config):
         writer.add_scalar('average train loss', avg_train_loss, epoch)
         writer.flush()
 
-        # Run validation at the end of every epoch
-        max_len_val = config.get('max_len', 500)  # Use the same max_len from config or a reasonable default
-        metrics = run_validation(model, val_dataloader, tokenizer_src, tokenizer_tgt, max_len_val, device, lambda msg: batch_iterator.write(msg), global_step, writer)
+        # Run validation at the end of every epoch if strategy is epoch
+        if config.get('evaluation_strategy', 'epoch') == 'epoch':
+            max_len_val = config.get('max_len', 500)
+            metrics = run_validation(model, val_dataloader, tokenizer_src, tokenizer_tgt, max_len_val, device, 
+                                    lambda msg: batch_iterator.write(msg), global_step, writer)
 
-        # Save the model at the end of every epoch
-        model_filename = get_weights_file_path(config, f"{epoch:02d}")
-        torch.save({
-            'epoch': epoch,
-            'model_state_dict': model.state_dict(),
-            'optimizer_state_dict': optimizer.state_dict(),
-            'global_step': global_step,
-            'metrics': metrics
-        }, model_filename)
+        # Save the model at the end of every epoch if strategy is epoch
+        if config.get('save_strategy', 'epoch') == 'epoch':
+            model_filename = get_weights_file_path(config, f"{epoch:02d}")
+            torch.save({
+                'epoch': epoch,
+                'global_step': global_step,
+                'model_state_dict': model.state_dict(),
+                'optimizer_state_dict': optimizer.state_dict(),
+                'scheduler_state_dict': scheduler.state_dict() if scheduler else None,
+                'metrics': metrics
+            }, model_filename)
+            print(f"Saved model at epoch {epoch} to {model_filename}")
         
         # Early stopping logic
         if early_stopping_enabled and metrics:
@@ -336,17 +490,18 @@ def train_model(config):
                         best_model_filename = get_weights_file_path(config, "best")
                         torch.save({
                             'epoch': epoch,
+                            'global_step': global_step,
                             'model_state_dict': model.state_dict(),
                             'optimizer_state_dict': optimizer.state_dict(),
-                            'global_step': global_step,
+                            'scheduler_state_dict': scheduler.state_dict() if scheduler else None,
                             'metrics': metrics
                         }, best_model_filename)
                         print(f"Saved new best model to {best_model_filename}")
                 else:
                     patience_counter += 1
-                    print(f"Validation {monitored_metric} did not improve. Patience: {patience_counter}/{config.get('early_stopping_patience', 3)}")
+                    print(f"Validation {monitored_metric} did not improve. Patience: {patience_counter}/{config.get('early_stopping_patience', 10)}")
                     
-                    if patience_counter >= config.get('early_stopping_patience', 3):
+                    if patience_counter >= config.get('early_stopping_patience', 10):
                         print(f"Early stopping triggered! No improvement for {patience_counter} epochs.")
                         break
 

@@ -1,18 +1,38 @@
 from pathlib import Path
+import math
 
 def get_config():
     return {
-        "batch_size": 8,
+        "batch_size": 16,
         "num_epochs": 20,
-        "lr": 10**-4,
-        "max_len": 500,  # Maximum length for filtering (optional)
-        "d_model": 512,
-        "datasource": 'vi_lo',  # Vietnamese-Lao
-        "lang_src": "vi",       # Vietnamese
-        "lang_tgt": "lo",       # Lao
-        "model_folder": "weights",
-        "model_basename": "tmodel_",
-        "preload": "latest",
+        "lr": 5e-4,
+        "max_len": 500,
+        
+        # Tham số mô hình
+        "d_model": 384,
+        "num_layers": 4,
+        "num_heads": 8,
+        "dropout": 0.15,
+        "d_ff": 1536,
+        
+
+        "weight_decay": 0.01,  # L2 regularization
+        "label_smoothing": 0.1,  # Label smoothing
+        "lr_scheduler": "cosine",
+        "warmup_steps": 4000,
+        "gradient_clip_val": 1.0,  # Gradient clipping
+        
+        # Regularization và data augmentation
+        "word_dropout_rate": 0.1,  # Random word dropout
+        
+        # Checkpointing và evaluation
+        "save_strategy": "steps",
+        "save_steps": 1000,
+        "evaluation_strategy": "steps",
+        "eval_steps": 1000,
+        
+        # Mixed precision training
+        "use_mixed_precision": True,  # Sử dụng mixed precision
         
         # Early stopping parameters
         "early_stopping": True,  # Whether to use early stopping
@@ -20,6 +40,13 @@ def get_config():
         "early_stopping_metric": "bleu",  # Metric to monitor: 'bleu', 'wer', 'cer', or 'loss'
         "early_stopping_min_delta": 0.0001,  # Minimum change to be considered as improvement
         "save_best_model": True,  # Whether to save the best model
+        
+        "datasource": 'vi_lo',  # Vietnamese-Lao
+        "lang_src": "vi",       # Vietnamese
+        "lang_tgt": "lo",       # Lao
+        "model_folder": "weights",
+        "model_basename": "tmodel_",
+        "preload": "latest",
         
         # Paths to the tokenizer models
         "tokenizer_src_path": "kaggle/working/tokenizer_vi.model",  # Path to Vietnamese tokenizer

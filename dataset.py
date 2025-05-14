@@ -3,15 +3,22 @@ import torch.nn as nn
 from torch.utils.data import Dataset
 import os
 import sentencepiece as spm
+import random
 
 class BilingualDataset(Dataset):
 
-    def __init__(self, src_file, tgt_file, tokenizer_src, tokenizer_tgt, max_len=None):
+    def __init__(self, src_file, tgt_file, tokenizer_src, tokenizer_tgt, max_len=None, word_dropout_rate=0.1, is_train=True):
         super().__init__()
         self.max_len = max_len  # Optional max length for filtering
+        self.word_dropout_rate = word_dropout_rate  # Probability of replacing a token with UNK
+        self.is_train = is_train  # Only apply word dropout during training
 
         self.tokenizer_src = tokenizer_src
         self.tokenizer_tgt = tokenizer_tgt
+        
+        # Get UNK token IDs
+        self.unk_token_src = tokenizer_src.piece_to_id("<unk>")
+        self.unk_token_tgt = tokenizer_tgt.piece_to_id("<unk>")
         
         # Load the source and target texts
         with open(src_file, 'r', encoding='utf-8') as f:
@@ -34,6 +41,16 @@ class BilingualDataset(Dataset):
         enc_input_tokens = self.tokenizer_src.encode(src_text)
         dec_input_tokens = self.tokenizer_tgt.encode(tgt_text)
         
+        # Apply word dropout during training
+        if self.is_train and self.word_dropout_rate > 0:
+            enc_input_tokens = self._apply_word_dropout(enc_input_tokens, self.unk_token_src)
+            
+            # Note: We don't apply word dropout to target tokens for label since it's what the model should predict
+            # But we can apply it to decoder input (what the model sees before making predictions)
+            dec_input_tokens_with_dropout = self._apply_word_dropout(dec_input_tokens.copy(), self.unk_token_tgt)
+        else:
+            dec_input_tokens_with_dropout = dec_input_tokens
+        
         # Optional filtering of sequences that are too long
         if self.max_len is not None:
             if len(enc_input_tokens) > self.max_len - 2 or len(dec_input_tokens) > self.max_len - 2:
@@ -43,11 +60,20 @@ class BilingualDataset(Dataset):
 
         return {
             "src_tokens": enc_input_tokens,
-            "tgt_tokens": dec_input_tokens,
+            "tgt_tokens": dec_input_tokens_with_dropout,  # Use version with dropout for input
+            "tgt_labels": dec_input_tokens,  # Use clean version for labels
             "src_text": src_text,
             "tgt_text": tgt_text,
         }
     
+    def _apply_word_dropout(self, tokens, unk_token_id):
+        """Randomly replace some tokens with UNK token."""
+        result = tokens.copy()
+        for i in range(len(result)):
+            if random.random() < self.word_dropout_rate:
+                result[i] = unk_token_id
+        return result
+
 def causal_mask(size):
     # Create a causal mask of shape [1, size, size]
     # The mask is 1 where attention is allowed, 0 where it is not
@@ -83,7 +109,9 @@ def collate_batch(batch, tokenizer_src, tokenizer_tgt):
     
     for i, item in enumerate(batch):
         src_tokens = item["src_tokens"]
-        tgt_tokens = item["tgt_tokens"]
+        tgt_tokens = item["tgt_tokens"]  # Input with word dropout
+        tgt_labels = item.get("tgt_labels", tgt_tokens)  # Labels without dropout
+        
         src_texts.append(item["src_text"])
         tgt_texts.append(item["tgt_text"])
         
@@ -102,7 +130,7 @@ def collate_batch(batch, tokenizer_src, tokenizer_tgt):
         decoder_inputs[i, 1:tgt_length] = torch.tensor(tgt_tokens, dtype=torch.int64)
         
         # Add target tokens and EOS to labels
-        labels[i, :tgt_length-1] = torch.tensor(tgt_tokens, dtype=torch.int64)
+        labels[i, :tgt_length-1] = torch.tensor(tgt_labels, dtype=torch.int64)
         labels[i, tgt_length-1] = eos_token_tgt
     
     # Create decoder masks (combining padding mask with causal mask)
