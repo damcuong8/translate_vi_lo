@@ -1,9 +1,10 @@
 from pathlib import Path
 import math
+import torch
 
 def get_config():
     return {
-        "batch_size": 16,
+        "batch_size": 16,  # Batch size per GPU
         "num_epochs": 20,
         "lr": 5e-4,
         "max_len": 500,
@@ -22,11 +23,18 @@ def get_config():
         "warmup_steps": 4000,
         "gradient_clip_val": 1.0,  # Gradient clipping
         
+        # Distributed training parameters
+        "distributed_training": True,  # Bật distributed training
+        "num_gpus": torch.cuda.device_count(),  # Tự động phát hiện số GPU
+        "gradient_accumulation_steps": 1,  # Gradient accumulation để tăng batch size hiệu quả
+        "find_unused_parameters": False,  # DDP param - đặt True nếu có lỗi về unused parameters
+        "backend": "nccl",  # Backend cho GPU communication (nccl cho NVIDIA GPU)
+        
         # Regularization và data augmentation
         "word_dropout_rate": 0.1,  # Random word dropout
         
         # Checkpointing và evaluation
-        "save_strategy": "steps",
+        "save_strategy": "epoch",
         "save_steps": 1000,
         "evaluation_strategy": "steps",
         "eval_steps": 1000,
