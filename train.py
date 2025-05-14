@@ -1,11 +1,12 @@
 from model import build_transformer
-from dataset import BilingualDataset, causal_mask
+from dataset import BilingualDataset, causal_mask, collate_batch
 from config import get_config, get_weights_file_path, latest_weights_file_path
 
 import torch
 import torch.nn as nn
 from torch.utils.data import Dataset, DataLoader, random_split
 from torch.optim.lr_scheduler import LambdaLR
+import functools
 
 import warnings
 from tqdm import tqdm
@@ -128,7 +129,7 @@ def get_ds(config):
         config['train_tgt_file'],
         tokenizer_src,
         tokenizer_tgt,
-        config['seq_len']
+        max_len=config.get('max_len', 500)  # Optional max length for filtering
     )
     
     val_ds = BilingualDataset(
@@ -136,8 +137,12 @@ def get_ds(config):
         config['val_tgt_file'],
         tokenizer_src,
         tokenizer_tgt,
-        config['seq_len']
+        max_len=config.get('max_len', 500)  # Optional max length for filtering
     )
+
+    # Create collate function with the tokenizers
+    train_collate_fn = functools.partial(collate_batch, tokenizer_src=tokenizer_src, tokenizer_tgt=tokenizer_tgt)
+    val_collate_fn = functools.partial(collate_batch, tokenizer_src=tokenizer_src, tokenizer_tgt=tokenizer_tgt)
 
     # Calculate max lengths if needed
     max_len_src = 0
@@ -146,23 +151,35 @@ def get_ds(config):
     # Sample a small subset to find max lengths (optional)
     sample_size = min(100, len(train_ds))
     for i in range(sample_size):
-        src_text = train_ds.src_texts[i]
-        tgt_text = train_ds.tgt_texts[i]
-        src_ids = tokenizer_src.encode(src_text)
-        tgt_ids = tokenizer_tgt.encode(tgt_text)
-        max_len_src = max(max_len_src, len(src_ids))
-        max_len_tgt = max(max_len_tgt, len(tgt_ids))
+        src_tokens = train_ds[i]["src_tokens"]
+        tgt_tokens = train_ds[i]["tgt_tokens"]
+        max_len_src = max(max_len_src, len(src_tokens))
+        max_len_tgt = max(max_len_tgt, len(tgt_tokens))
 
     print(f'Max length of source sentence (sample): {max_len_src}')
     print(f'Max length of target sentence (sample): {max_len_tgt}')
 
-    train_dataloader = DataLoader(train_ds, batch_size=config['batch_size'], shuffle=True)
-    val_dataloader = DataLoader(val_ds, batch_size=1, shuffle=True)
+    # Pass the collate_fn to DataLoader
+    train_dataloader = DataLoader(
+        train_ds, 
+        batch_size=config['batch_size'], 
+        shuffle=True, 
+        collate_fn=train_collate_fn
+    )
+    
+    val_dataloader = DataLoader(
+        val_ds, 
+        batch_size=1, 
+        shuffle=True, 
+        collate_fn=val_collate_fn
+    )
 
     return train_dataloader, val_dataloader, tokenizer_src, tokenizer_tgt
 
 def get_model(config, vocab_src_len, vocab_tgt_len):
-    model = build_transformer(vocab_src_len, vocab_tgt_len, config["seq_len"], config['seq_len'], d_model=config['d_model'])
+    # Use max_len instead of seq_len as the maximum sequence length
+    max_len = config.get("max_len", 500)
+    model = build_transformer(vocab_src_len, vocab_tgt_len, max_len, max_len, d_model=config['d_model'])
     return model
 
 def train_model(config):
