@@ -805,17 +805,28 @@ def train_model(config=None):
     # Check if we're running on Kaggle
     is_kaggle = os.path.exists('/kaggle')
     
+    # Force single GPU if specified in config
+    force_single_gpu = config.get('force_single_gpu', False)
+    if force_single_gpu:
+        print("Forcing single GPU training as specified in config")
+        world_size = 1
+        use_distributed = False
+    
     if is_kaggle:
         print("Detected Kaggle environment. Adjusting distributed training settings.")
         # Set shorter timeout, lower batch size if needed
         os.environ['NCCL_BLOCKING_WAIT'] = '1'  # Use blocking wait for better stability
         os.environ['NCCL_SOCKET_IFNAME'] = 'lo'  # Use loopback interface
         os.environ['NCCL_DEBUG'] = 'WARN'  # Set debug level
+        # Increase timeout for NCCL operations (default is 30 minutes/1800000 ms)
+        os.environ['NCCL_TIMEOUT'] = str(config.get('nccl_timeout', 3600000))  # 1 hour default
         
         # Try distributed, but be ready to fall back
-        try_distributed = use_distributed and world_size > 1
+        try_distributed = use_distributed and world_size > 1 and not force_single_gpu
     else:
-        try_distributed = use_distributed and world_size > 1
+        # Increase timeout for NCCL operations
+        os.environ['NCCL_TIMEOUT'] = str(config.get('nccl_timeout', 3600000))  # 1 hour default
+        try_distributed = use_distributed and world_size > 1 and not force_single_gpu
     
     # Try distributed training first if applicable
     if try_distributed:
@@ -848,7 +859,7 @@ def train_model(config=None):
             return
             
         except Exception as e:
-            print(f"Distributed training failed with error: {str(e)}")
+            print(f"Distributed training failed with error: \n{str(e)}")
             print("Falling back to single GPU training...")
     
     # If distributed training failed or wasn't attempted, use single GPU training
@@ -1049,10 +1060,10 @@ def train_model_single(config, device):
                 
                 metrics = run_validation(
                     model, val_dataloader, tokenizer_src, tokenizer_tgt, 
-                    max_len_val, device, lambda msg: print(msg) if rank == 0 else None, 
+                    max_len_val, device, lambda msg: print(msg), 
                     global_step, writer,
-                    num_examples=5,  # Hiển thị nhiều ví dụ hơn
-                    num_display=5    # Hiển thị tất cả các ví dụ đánh giá
+                    num_examples=5,
+                    num_display=5
                 )
                 
                 # In kết quả BLEU và các metrics khác
@@ -1101,10 +1112,10 @@ def train_model_single(config, device):
             
             metrics = run_validation(
                 model, val_dataloader, tokenizer_src, tokenizer_tgt, 
-                max_len_val, device, lambda msg: print(msg) if rank == 0 else None, 
+                max_len_val, device, lambda msg: print(msg), 
                 global_step, writer,
-                num_examples=5,  # Hiển thị nhiều ví dụ hơn
-                num_display=5    # Hiển thị tất cả các ví dụ đánh giá
+                num_examples=5,
+                num_display=5
             )
             
             # In kết quả BLEU và các metrics khác

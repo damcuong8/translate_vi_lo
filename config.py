@@ -5,7 +5,7 @@ import torch
 def get_config():
     return {
         "batch_size": 16,  # Batch size per GPU
-        "num_epochs": 20,
+        "num_epochs": 100,
         "lr": 5e-4,
         "max_len": 500,
         
@@ -17,18 +17,18 @@ def get_config():
         "d_ff": 1536,
         
 
-        "weight_decay": 0.01,  # L2 regularization
+        "weight_decay": 0.0001,  # L2 regularization
         "label_smoothing": 0.1,  # Label smoothing
         "lr_scheduler": "cosine",
         "warmup_steps": 4000,
         "gradient_clip_val": 1.0,  # Gradient clipping
         
         # Distributed training parameters
-        "distributed_training": True,  # Bật distributed training
-        "num_gpus": torch.cuda.device_count(),  # Tự động phát hiện số GPU
-        "gradient_accumulation_steps": 1,  # Gradient accumulation để tăng batch size hiệu quả
-        "find_unused_parameters": False,  # DDP param - đặt True nếu có lỗi về unused parameters
-        "backend": "nccl",  # Backend cho GPU communication (nccl cho NVIDIA GPU)
+        "distributed_training": False,  # Bật distributed training
+        "force_single_gpu": True,  # Set to True to force single GPU training
+        "num_gpus": 2,             # Number of GPUs to use (will use min of this and available)
+        "backend": "nccl",         # Backend for distributed training
+        "nccl_timeout": 3600000,   # 1 hour timeout for NCCL operations (in ms)
         
         # Regularization và data augmentation
         "word_dropout_rate": 0.1,  # Random word dropout
@@ -43,28 +43,28 @@ def get_config():
         "use_mixed_precision": True,  # Sử dụng mixed precision
         
         # Early stopping parameters
-        "early_stopping": True,  # Whether to use early stopping
+        "early_stopping": False,  # Whether to use early stopping
         "early_stopping_patience": 10,  # Number of epochs with no improvement to stop training
         "early_stopping_metric": "bleu",  # Metric to monitor: 'bleu', 'wer', 'cer', or 'loss'
-        "early_stopping_min_delta": 0.0001,  # Minimum change to be considered as improvement
+        "early_stopping_min_delta": 0.001,  # Minimum change to be considered as improvement
         "save_best_model": True,  # Whether to save the best model
         
-        "datasource": 'vi_lo',  # Vietnamese-Lao
+        "datasource": "VLSP2023",
         "lang_src": "vi",       # Vietnamese
         "lang_tgt": "lo",       # Lao
-        "model_folder": "weights",
+        "model_folder": "vi_lo_weights",
         "model_basename": "tmodel_",
-        "preload": "latest",
+        "preload": None,
         
         # Paths to the tokenizer models
-        "tokenizer_src_path": "kaggle/working/tokenizer_vi.model",  # Path to Vietnamese tokenizer
-        "tokenizer_tgt_path": "kaggle/working/tokenizer_lo.model",  # Path to Lao tokenizer
+        "tokenizer_src_path": "./vi_lo_weights/tokenizer_vi.model",  # Path to Vietnamese tokenizer
+        "tokenizer_tgt_path": "./vi_lo_weights/tokenizer_lo.model",  # Path to Lao tokenizer
         
         # Paths to data files
-        "train_src_file": "VLSP2023/Train/train2023.vi",  # Vietnamese training data
-        "train_tgt_file": "VLSP2023/Train/train2023.lo",  # Lao training data
-        "val_src_file": "VLSP2023/Dev/dev2023.vi",      # Vietnamese validation data
-        "val_tgt_file": "VLSP2023/Dev/dev2023.lo",      # Lao validation data
+        "train_src_file": "./VLSP2023/Train/vi-lo.train.vi",  # Vietnamese training data
+        "train_tgt_file": "./VLSP2023/Train/vi-lo.train.lo",  # Lao training data
+        "val_src_file": "./VLSP2023/Dev/vi-lo.dev.vi",      # Vietnamese validation data
+        "val_tgt_file": "./VLSP2023/Dev/vi-lo.dev.lo",      # Lao validation data
         
         "experiment_name": "runs/vi_lo_model"
     }
