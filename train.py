@@ -641,11 +641,9 @@ def train_model_distributed(rank, world_size, config):
                     print(f"Rank {rank}: Saved checkpoint at step {global_step} to {checkpoint_filename}")
                 
                 # Apply early stopping logic
-                _apply_early_stopping(
+                best_metric_value = _apply_early_stopping(
                     config, metrics, best_metric_value, patience_counter, global_step,
-                    model.module, optimizer, scheduler, epoch, 
-                    lambda new_val: globals().update(best_metric_value=new_val),
-                    lambda new_val: globals().update(patience_counter=new_val)
+                    model.module, optimizer, scheduler, epoch
                 )
         
         # Calculate average training loss for this epoch
@@ -710,9 +708,7 @@ def train_model_distributed(rank, world_size, config):
             # Apply early stopping logic
             should_stop = _apply_early_stopping(
                 config, metrics, best_metric_value, patience_counter, global_step,
-                model.module, optimizer, scheduler, epoch, 
-                lambda new_val: globals().update(best_metric_value=new_val),
-                lambda new_val: globals().update(patience_counter=new_val)
+                model.module, optimizer, scheduler, epoch
             )
             
             if should_stop:
@@ -734,7 +730,7 @@ def train_model_distributed(rank, world_size, config):
             print(f"Best validation {config.get('early_stopping_metric', 'bleu')}: {best_metric_value:.6f}")
 
 def _apply_early_stopping(config, metrics, best_metric_value, patience_counter, global_step,
-                          model, optimizer, scheduler, epoch, set_best_value, set_patience_counter):
+                          model, optimizer, scheduler, epoch):
     """Helper function to apply early stopping logic"""
     should_stop = False
     
@@ -757,9 +753,9 @@ def _apply_early_stopping(config, metrics, best_metric_value, patience_counter, 
             if is_improvement:
                 print(f"Validation {monitored_metric} improved from {best_metric_value:.6f} to {current_metric_value:.6f}")
                 # Update best metric value
-                set_best_value(current_metric_value)
+                best_metric_value = current_metric_value
                 # Reset patience counter
-                set_patience_counter(0)
+                patience_counter = 0
                 
                 # Save the best model if configured
                 if config.get('save_best_model', True):
@@ -776,7 +772,7 @@ def _apply_early_stopping(config, metrics, best_metric_value, patience_counter, 
             else:
                 # Increment patience counter
                 new_patience = patience_counter + 1
-                set_patience_counter(new_patience)
+                patience_counter = new_patience
                 print(f"Validation {monitored_metric} did not improve. Patience: {new_patience}/{config.get('early_stopping_patience', 10)}")
                 
                 if new_patience >= config.get('early_stopping_patience', 10):
@@ -1072,14 +1068,12 @@ def train_model_single(config, device):
                     print(f"Saved checkpoint at step {global_step} to {checkpoint_filename}")
                 
                 # Apply early stopping logic
-                should_stop = _apply_early_stopping(
+                best_metric_value = _apply_early_stopping(
                     config, metrics, best_metric_value, patience_counter, global_step,
-                    model, optimizer, scheduler, epoch,
-                    lambda new_val: globals().update(best_metric_value=new_val),
-                    lambda new_val: globals().update(patience_counter=new_val)
+                    model, optimizer, scheduler, epoch
                 )
                 
-                if should_stop:
+                if best_metric_value:
                     print(f"Early stopping triggered! No improvement for {patience_counter} epochs.")
                     break
         
@@ -1128,9 +1122,7 @@ def train_model_single(config, device):
             # Apply early stopping logic
             should_stop = _apply_early_stopping(
                 config, metrics, best_metric_value, patience_counter, global_step,
-                model, optimizer, scheduler, epoch,
-                lambda new_val: globals().update(best_metric_value=new_val),
-                lambda new_val: globals().update(patience_counter=new_val)
+                model, optimizer, scheduler, epoch
             )
             
             if should_stop:
