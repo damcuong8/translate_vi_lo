@@ -30,6 +30,33 @@ from torchmetrics.text import CharErrorRate, WordErrorRate, BLEUScore
 from torch.utils.tensorboard import SummaryWriter
 
 def greedy_decode(model, source, source_mask, tokenizer_src, tokenizer_tgt, max_len, device):
+    """
+    Performs greedy decoding on the input source sentence.
+    
+    Args:
+        model: The model to use for decoding (can be standard model or DDP wrapped model)
+        source: The source tensor
+        source_mask: The source mask tensor
+        tokenizer_src: The source tokenizer
+        tokenizer_tgt: The target tokenizer
+        max_len: The maximum length of the generated sentence
+        device: The device to use
+        
+    Returns:
+        The decoded output tensor
+    """
+    # Check if the model is wrapped in DDP
+    if hasattr(model, 'module'):
+        # Use model.module for DDP models
+        return _greedy_decode_internal(model.module, source, source_mask, tokenizer_src, tokenizer_tgt, max_len, device)
+    else:
+        # Use model directly for standard models
+        return _greedy_decode_internal(model, source, source_mask, tokenizer_src, tokenizer_tgt, max_len, device)
+
+def _greedy_decode_internal(model, source, source_mask, tokenizer_src, tokenizer_tgt, max_len, device):
+    """
+    Internal implementation of greedy decoding to be used by the wrapper function
+    """
     sos_idx = tokenizer_tgt.piece_to_id("<s>")
     eos_idx = tokenizer_tgt.piece_to_id("</s>")
 
@@ -592,7 +619,7 @@ def train_model_distributed(rank, world_size, config):
                 max_len_val = config.get('max_len', 500)
                 metrics = run_validation(
                     model, val_dataloader, tokenizer_src, tokenizer_tgt, 
-                    max_len_val, device, lambda msg: print(msg), 
+                    max_len_val, device, lambda msg: print(msg) if rank == 0 else None, 
                     global_step, writer,
                     num_examples=5,  # Hiển thị nhiều ví dụ hơn
                     num_display=5    # Hiển thị tất cả các ví dụ đánh giá
@@ -651,7 +678,7 @@ def train_model_distributed(rank, world_size, config):
             
             metrics = run_validation(
                 model, val_dataloader, tokenizer_src, tokenizer_tgt, 
-                max_len_val, device, lambda msg: print(msg), 
+                max_len_val, device, lambda msg: print(msg) if rank == 0 else None, 
                 global_step, writer,
                 num_examples=5,  # Hiển thị nhiều ví dụ hơn
                 num_display=5    # Hiển thị tất cả các ví dụ đánh giá
@@ -1015,7 +1042,7 @@ def train_model_single(config, device):
                 
                 metrics = run_validation(
                     model, val_dataloader, tokenizer_src, tokenizer_tgt, 
-                    max_len_val, device, lambda msg: print(msg), 
+                    max_len_val, device, lambda msg: print(msg) if rank == 0 else None, 
                     global_step, writer,
                     num_examples=5,  # Hiển thị nhiều ví dụ hơn
                     num_display=5    # Hiển thị tất cả các ví dụ đánh giá
@@ -1069,7 +1096,7 @@ def train_model_single(config, device):
             
             metrics = run_validation(
                 model, val_dataloader, tokenizer_src, tokenizer_tgt, 
-                max_len_val, device, lambda msg: print(msg), 
+                max_len_val, device, lambda msg: print(msg) if rank == 0 else None, 
                 global_step, writer,
                 num_examples=5,  # Hiển thị nhiều ví dụ hơn
                 num_display=5    # Hiển thị tất cả các ví dụ đánh giá
