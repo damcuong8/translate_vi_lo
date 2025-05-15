@@ -60,7 +60,23 @@ def greedy_decode(model, source, source_mask, tokenizer_src, tokenizer_tgt, max_
     return decoder_input.squeeze(0)
 
 
-def run_validation(model, validation_ds, tokenizer_src, tokenizer_tgt, max_len, device, print_msg, global_step, writer, num_examples=16, num_display=2):
+def run_validation(model, validation_ds, tokenizer_src, tokenizer_tgt, max_len, device, print_msg, global_step, writer, num_examples=16, num_display=5):
+    """
+    Runs validation on the validation dataset
+    
+    Args:
+        model: The model to validate
+        validation_ds: The validation dataset
+        tokenizer_src: The source tokenizer
+        tokenizer_tgt: The target tokenizer
+        max_len: The maximum length for generated sequences
+        device: The device to run validation on
+        print_msg: A function to print messages
+        global_step: The current global step
+        writer: The tensorboard writer
+        num_examples: The number of examples to evaluate
+        num_display: The number of examples to display
+    """
     model.eval()
     count = 0
 
@@ -72,6 +88,9 @@ def run_validation(model, validation_ds, tokenizer_src, tokenizer_tgt, max_len, 
     tokenized_expected = []
     tokenized_predicted = []
 
+    print_msg("-" * 80)
+    print_msg(f"Running validation on {num_examples} examples, displaying {num_display} examples")
+    
     try:
         # get the console window width
         with os.popen('stty size', 'r') as console:
@@ -114,14 +133,14 @@ def run_validation(model, validation_ds, tokenizer_src, tokenizer_tgt, max_len, 
                 tokenized_predicted.append([str(model_out_text)])  # Fallback
             
             # Print only the first few examples
-            if count <= num_display:
+            if count <= min(num_display, num_examples):
                 print_msg('-'*console_width)
                 print_msg(f"{f'SOURCE: ':>12}{source_text}")
                 print_msg(f"{f'TARGET: ':>12}{target_text}")
                 print_msg(f"{f'PREDICTED: ':>12}{model_out_text}")
 
             if count == num_examples:
-                if count > num_display:
+                if num_display < num_examples:
                     print_msg('-'*console_width)
                     print_msg(f"... {count - num_display} more examples evaluated but not displayed ...")
                 print_msg('-'*console_width)
@@ -135,14 +154,16 @@ def run_validation(model, validation_ds, tokenizer_src, tokenizer_tgt, max_len, 
         # Compute the char error rate 
         metric = CharErrorRate()
         cer = metric(predicted, expected)
-        writer.add_scalar('validation cer', cer, global_step)
+        print_msg(f"Character Error Rate: {cer.item():.6f}")
+        writer.add_scalar('validation/cer', cer, global_step)
         writer.flush()
         metrics['cer'] = cer.item()
 
         # Compute the word error rate
         metric = WordErrorRate()
         wer = metric(predicted, expected)
-        writer.add_scalar('validation wer', wer, global_step)
+        print_msg(f"Word Error Rate: {wer.item():.6f}")
+        writer.add_scalar('validation/wer', wer, global_step)
         writer.flush()
         metrics['wer'] = wer.item()
 
@@ -162,9 +183,9 @@ def run_validation(model, validation_ds, tokenizer_src, tokenizer_tgt, max_len, 
             bleu_metric = BLEUScore()
             bleu = bleu_metric(tokenized_predicted, references)
             
-            print_msg(f"BLEU score: {bleu.item():.4f}")
+            print_msg(f"BLEU score: {bleu.item():.6f}")
             
-            writer.add_scalar('validation BLEU', bleu, global_step)
+            writer.add_scalar('validation/BLEU', bleu, global_step)
             writer.flush()
             metrics['bleu'] = bleu.item()
         except Exception as e:
@@ -184,9 +205,9 @@ def run_validation(model, validation_ds, tokenizer_src, tokenizer_tgt, max_len, 
                 smoothie = SmoothingFunction().method3
                 bleu = corpus_bleu(references, hypotheses, smoothing_function=smoothie)
                 
-                print_msg(f"NLTK BLEU score: {bleu:.4f}")
+                print_msg(f"NLTK BLEU score: {bleu:.6f}")
                 
-                writer.add_scalar('validation BLEU', bleu, global_step)
+                writer.add_scalar('validation/BLEU', bleu, global_step)
                 writer.flush()
                 metrics['bleu'] = bleu
             except Exception as e2:
@@ -569,8 +590,13 @@ def train_model_distributed(rank, world_size, config):
                 # We only run validation on the main process
                 model.eval()
                 max_len_val = config.get('max_len', 500)
-                metrics = run_validation(model.module, val_dataloader, tokenizer_src, tokenizer_tgt, max_len_val, device, 
-                                  lambda msg: tqdm.write(msg) if rank == 0 else None, global_step, writer)
+                metrics = run_validation(
+                    model, val_dataloader, tokenizer_src, tokenizer_tgt, 
+                    max_len_val, device, lambda msg: print(msg), 
+                    global_step, writer,
+                    num_examples=5,  # Hiển thị nhiều ví dụ hơn
+                    num_display=5    # Hiển thị tất cả các ví dụ đánh giá
+                )
                 model.train()  # Switch back to train mode
                 
                 # Save checkpoint at this step if needed
@@ -622,8 +648,23 @@ def train_model_distributed(rank, world_size, config):
         if rank == 0 and config.get('evaluation_strategy', 'epoch') == 'epoch':
             model.eval()
             max_len_val = config.get('max_len', 500)
-            metrics = run_validation(model.module, val_dataloader, tokenizer_src, tokenizer_tgt, max_len_val, device, 
-                              lambda msg: print(msg) if rank == 0 else None, global_step, writer)
+            
+            metrics = run_validation(
+                model, val_dataloader, tokenizer_src, tokenizer_tgt, 
+                max_len_val, device, lambda msg: print(msg), 
+                global_step, writer,
+                num_examples=5,  # Hiển thị nhiều ví dụ hơn
+                num_display=5    # Hiển thị tất cả các ví dụ đánh giá
+            )
+            
+            # In kết quả BLEU và các metrics khác
+            if metrics:
+                print("-" * 80)
+                print(f"Validation results at epoch {epoch}:")
+                for metric_name, metric_value in metrics.items():
+                    print(f"  {metric_name}: {metric_value:.6f}")
+                print("-" * 80)
+            
             model.train()  # Switch back to train mode
 
             # Save the model at the end of every epoch if strategy is epoch
@@ -974,9 +1015,19 @@ def train_model_single(config, device):
                 
                 metrics = run_validation(
                     model, val_dataloader, tokenizer_src, tokenizer_tgt, 
-                    max_len_val, device, lambda msg: tqdm.write(msg), 
-                    global_step, writer
+                    max_len_val, device, lambda msg: print(msg), 
+                    global_step, writer,
+                    num_examples=5,  # Hiển thị nhiều ví dụ hơn
+                    num_display=5    # Hiển thị tất cả các ví dụ đánh giá
                 )
+                
+                # In kết quả BLEU và các metrics khác
+                if metrics:
+                    print("-" * 80)
+                    print(f"Validation results at epoch {epoch}:")
+                    for metric_name, metric_value in metrics.items():
+                        print(f"  {metric_name}: {metric_value:.6f}")
+                    print("-" * 80)
                 
                 model.train()  # Switch back to train mode
                 
@@ -1019,8 +1070,18 @@ def train_model_single(config, device):
             metrics = run_validation(
                 model, val_dataloader, tokenizer_src, tokenizer_tgt, 
                 max_len_val, device, lambda msg: print(msg), 
-                global_step, writer
+                global_step, writer,
+                num_examples=5,  # Hiển thị nhiều ví dụ hơn
+                num_display=5    # Hiển thị tất cả các ví dụ đánh giá
             )
+            
+            # In kết quả BLEU và các metrics khác
+            if metrics:
+                print("-" * 80)
+                print(f"Validation results at epoch {epoch}:")
+                for metric_name, metric_value in metrics.items():
+                    print(f"  {metric_name}: {metric_value:.6f}")
+                print("-" * 80)
             
             model.train()  # Switch back to train mode
             

@@ -36,7 +36,7 @@ def get_config():
         # Checkpointing và evaluation
         "save_strategy": "epoch",
         "save_steps": 1000,
-        "evaluation_strategy": "steps",
+        "evaluation_strategy": "epoch",
         "eval_steps": 1000,
         
         # Mixed precision training
