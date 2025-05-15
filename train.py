@@ -176,70 +176,81 @@ def run_validation(model, validation_ds, tokenizer_src, tokenizer_tgt, max_len, 
     # Initialize metrics
     metrics = {}
     
+    # Always calculate metrics regardless of writer
+    # Compute the char error rate 
+    metric = CharErrorRate()
+    cer = metric(predicted, expected)
+    print_msg(f"Character Error Rate: {cer.item():.6f}")
+    metrics['cer'] = cer.item()
+    
+    # Log to TensorBoard if writer exists
     if writer:
-        # Evaluate the character error rate
-        # Compute the char error rate 
-        metric = CharErrorRate()
-        cer = metric(predicted, expected)
-        print_msg(f"Character Error Rate: {cer.item():.6f}")
         writer.add_scalar('validation/cer', cer, global_step)
         writer.flush()
-        metrics['cer'] = cer.item()
 
-        # Compute the word error rate
-        metric = WordErrorRate()
-        wer = metric(predicted, expected)
-        print_msg(f"Word Error Rate: {wer.item():.6f}")
+    # Compute the word error rate
+    metric = WordErrorRate()
+    wer = metric(predicted, expected)
+    print_msg(f"Word Error Rate: {wer.item():.6f}")
+    metrics['wer'] = wer.item()
+    
+    # Log to TensorBoard if writer exists
+    if writer:
         writer.add_scalar('validation/wer', wer, global_step)
         writer.flush()
-        metrics['wer'] = wer.item()
 
-        # Compute the BLEU metric with properly tokenized input
-        try:
-            # Make sure inputs are properly formatted
-            # BLEU expects references to be a list of lists
-            references = [[t] for t in tokenized_expected]  # Wrap each reference in a list
-            
-            # Print debug info
-            print_msg(f"Computing BLEU score with {len(tokenized_predicted)} hypotheses and {len(references)} references")
-            if len(tokenized_predicted) > 0 and len(references) > 0:
-                print_msg(f"Example hypothesis: {tokenized_predicted[0][:10]}")
-                print_msg(f"Example reference: {references[0][0][:10]}")
-            
-            # Create new BLEU metric instance
-            bleu_metric = BLEUScore()
-            bleu = bleu_metric(tokenized_predicted, references)
-            
-            print_msg(f"BLEU score: {bleu.item():.6f}")
-            
+    # Compute the BLEU metric with properly tokenized input
+    try:
+        # Make sure inputs are properly formatted
+        # BLEU expects references to be a list of lists
+        references = [[t] for t in tokenized_expected]  # Wrap each reference in a list
+        
+        # Print debug info
+        print_msg(f"Computing BLEU score with {len(tokenized_predicted)} hypotheses and {len(references)} references")
+        if len(tokenized_predicted) > 0 and len(references) > 0:
+            print_msg(f"Example hypothesis: {tokenized_predicted[0][:10]}")
+            print_msg(f"Example reference: {references[0][0][:10]}")
+        
+        # Create new BLEU metric instance
+        bleu_metric = BLEUScore()
+        bleu = bleu_metric(tokenized_predicted, references)
+        
+        print_msg(f"BLEU score: {bleu.item():.6f}")
+        metrics['bleu'] = bleu.item()
+        
+        # Log to TensorBoard if writer exists
+        if writer:
             writer.add_scalar('validation/BLEU', bleu, global_step)
             writer.flush()
-            metrics['bleu'] = bleu.item()
-        except Exception as e:
-            print_msg(f"Error calculating BLEU score: {str(e)}")
-            # As a fallback, try another approach
-            try:
-                # Use a different approach - calculate BLEU without tokenization
-                from nltk.translate.bleu_score import corpus_bleu, SmoothingFunction
-                
-                print_msg("Trying NLTK corpus_bleu as fallback")
-                
-                # Format for NLTK's corpus_bleu
-                references = [[r.split()] for r in expected]  # Tokenize again
-                hypotheses = [p.split() for p in predicted]   # Tokenize again
-                
-                # Use smoothing
-                smoothie = SmoothingFunction().method3
-                bleu = corpus_bleu(references, hypotheses, smoothing_function=smoothie)
-                
-                print_msg(f"NLTK BLEU score: {bleu:.6f}")
-                
+            
+    except Exception as e:
+        print_msg(f"Error calculating BLEU score: {str(e)}")
+        # As a fallback, try another approach
+        try:
+            # Use a different approach - calculate BLEU without tokenization
+            from nltk.translate.bleu_score import corpus_bleu, SmoothingFunction
+            
+            print_msg("Trying NLTK corpus_bleu as fallback")
+            
+            # Format for NLTK's corpus_bleu
+            references = [[r.split()] for r in expected]  # Tokenize again
+            hypotheses = [p.split() for p in predicted]   # Tokenize again
+            
+            # Use smoothing
+            smoothie = SmoothingFunction().method3
+            bleu = corpus_bleu(references, hypotheses, smoothing_function=smoothie)
+            
+            print_msg(f"NLTK BLEU score: {bleu:.6f}")
+            metrics['bleu'] = bleu
+            
+            # Log to TensorBoard if writer exists
+            if writer:
                 writer.add_scalar('validation/BLEU', bleu, global_step)
                 writer.flush()
-                metrics['bleu'] = bleu
-            except Exception as e2:
-                print_msg(f"Fallback BLEU calculation also failed: {str(e2)}")
-                metrics['bleu'] = 0.0
+                
+        except Exception as e2:
+            print_msg(f"Fallback BLEU calculation also failed: {str(e2)}")
+            metrics['bleu'] = 0.0
     
     return metrics
 
