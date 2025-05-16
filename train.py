@@ -373,8 +373,7 @@ def get_autocast_context(use_mixed_precision=False):
         return nullcontext()
 
 def train_model_distributed(rank, world_size, config):
-    """
-    Train the model in distributed mode.
+    """Train the model in distributed mode.
     Args:
         rank: Current process rank
         world_size: Total number of processes
@@ -443,21 +442,37 @@ def train_model_distributed(rank, world_size, config):
     initial_epoch = 0
     global_step = 0
     preload = config['preload']
-    model_filename = None
     
     if preload and rank == 0:
-        model_filename = latest_weights_file_path(config) if preload == 'latest' else get_weights_file_path(config, preload) if preload else None
-        if model_filename and os.path.exists(model_filename):
-            print(f'Rank {rank}: Preloading model {model_filename}')
+        # Print the preload value for debugging
+        if rank == 0:
+            print(f'Preload value: {preload}')
+        
+        # Determine if we should load a model
+        if os.path.exists(preload):
+            # Use the provided path directly
+            model_filename = preload
+            if rank == 0:
+                print(f'Using model path: {model_filename}')
+                print(f'Model file exists: {os.path.exists(model_filename)}')
+            
+            # Load the model
+            if rank == 0:
+                print(f'Loading model from {model_filename}')
             state = torch.load(model_filename, map_location=device)
             model.module.load_state_dict(state['model_state_dict'])
             initial_epoch = state['epoch'] + 1
             optimizer.load_state_dict(state['optimizer_state_dict'])
             global_step = state.get('global_step', 0)
-            print(f'Rank {rank}: Loaded checkpoint. Resuming from epoch {initial_epoch}, global step {global_step}')
+            if rank == 0:
+                print(f'Loaded checkpoint. Resuming from epoch {initial_epoch}, global step {global_step}')
         else:
-            print(f'Rank {rank}: No model to preload, starting from scratch')
-    
+            if rank == 0:
+                print(f'Model file not found at {preload}')
+    else:
+        if rank == 0:
+            print('No model to preload, starting from scratch')
+            
     # Broadcast initial_epoch and global_step from rank 0 to all processes
     if world_size > 1:
         initial_epoch_tensor = torch.tensor(initial_epoch, device=device)
@@ -652,7 +667,7 @@ def train_model_distributed(rank, world_size, config):
                     print(f"Rank {rank}: Saved checkpoint at step {global_step} to {checkpoint_filename}")
                 
                 # Apply early stopping logic
-                best_metric_value = _apply_early_stopping(
+                best_metric_value, patience_counter, should_stop = _apply_early_stopping(
                     config, metrics, best_metric_value, patience_counter, global_step,
                     model.module, optimizer, scheduler, epoch
                 )
@@ -742,12 +757,13 @@ def train_model_distributed(rank, world_size, config):
 
 def _apply_early_stopping(config, metrics, best_metric_value, patience_counter, global_step,
                           model, optimizer, scheduler, epoch):
-    """Helper function to apply early stopping logic"""
+    """Helper function to apply early stopping logic and save the best model"""
     should_stop = False
+    is_best_model = False
+    monitored_metric = config.get('early_stopping_metric', 'bleu')
     
-    if config.get('early_stopping', False) and metrics:
+    if metrics:
         # Get the value of the monitored metric
-        monitored_metric = config.get('early_stopping_metric', 'bleu')
         current_metric_value = metrics.get(monitored_metric)
         
         if current_metric_value is not None:
@@ -767,29 +783,45 @@ def _apply_early_stopping(config, metrics, best_metric_value, patience_counter, 
                 best_metric_value = current_metric_value
                 # Reset patience counter
                 patience_counter = 0
+                # Flag this as best model
+                is_best_model = True
                 
-                # Save the best model if configured
-                if config.get('save_best_model', True):
-                    best_model_filename = get_weights_file_path(config, "best")
-                    torch.save({
-                        'epoch': epoch,
-                        'global_step': global_step,
-                        'model_state_dict': model.state_dict(),
-                        'optimizer_state_dict': optimizer.state_dict(),
-                        'scheduler_state_dict': scheduler.state_dict() if scheduler else None,
-                        'metrics': metrics
-                    }, best_model_filename)
-                    print(f"Saved new best model to {best_model_filename}")
+                # Save the best model (regardless of early stopping being enabled)
+                best_model_filename = get_weights_file_path(config, "best")
+                torch.save({
+                    'epoch': epoch,
+                    'global_step': global_step,
+                    'model_state_dict': model.state_dict(),
+                    'optimizer_state_dict': optimizer.state_dict(),
+                    'scheduler_state_dict': scheduler.state_dict() if scheduler else None,
+                    'metrics': metrics,
+                    'best_metric': {monitored_metric: current_metric_value}
+                }, best_model_filename)
+                print(f"Saved new best model to {best_model_filename}")
+                
+                # Also save with epoch number for reference
+                numbered_model_filename = get_weights_file_path(config, f"best_epoch_{epoch:02d}")
+                torch.save({
+                    'epoch': epoch,
+                    'global_step': global_step,
+                    'model_state_dict': model.state_dict(),
+                    'optimizer_state_dict': optimizer.state_dict(),
+                    'scheduler_state_dict': scheduler.state_dict() if scheduler else None,
+                    'metrics': metrics,
+                    'best_metric': {monitored_metric: current_metric_value}
+                }, numbered_model_filename)
             else:
-                # Increment patience counter
-                new_patience = patience_counter + 1
-                patience_counter = new_patience
-                print(f"Validation {monitored_metric} did not improve. Patience: {new_patience}/{config.get('early_stopping_patience', 10)}")
-                
-                if new_patience >= config.get('early_stopping_patience', 10):
-                    should_stop = True
+                # Increment patience counter if early stopping is enabled
+                if config.get('early_stopping', False):
+                    new_patience = patience_counter + 1
+                    patience_counter = new_patience
+                    print(f"Validation {monitored_metric} did not improve. Patience: {new_patience}/{config.get('early_stopping_patience', 10)}")
+                    
+                    if new_patience >= config.get('early_stopping_patience', 10):
+                        should_stop = True
+                        print(f"Early stopping triggered! No improvement for {new_patience} epochs.")
     
-    return should_stop
+    return best_metric_value, patience_counter, should_stop
 
 def train_model(config=None):
     """Main entry point for training"""
@@ -906,15 +938,30 @@ def train_model_single(config, device):
     global_step = 0
     preload = config['preload']
     
-    model_filename = latest_weights_file_path(config) if preload == 'latest' else get_weights_file_path(config, preload) if preload else None
-    if model_filename and os.path.exists(model_filename):
-        print(f'Preloading model {model_filename}')
-        state = torch.load(model_filename, map_location=device)
-        model.load_state_dict(state['model_state_dict'])
-        initial_epoch = state['epoch'] + 1
-        optimizer.load_state_dict(state['optimizer_state_dict'])
-        global_step = state.get('global_step', 0)
-        print(f'Loaded checkpoint. Resuming from epoch {initial_epoch}, global step {global_step}')
+    # Print the preload value for debugging
+    print(f'Preload value: {preload}')
+    
+    # Determine if we should load a model
+    if preload and os.path.exists(preload):
+        # Use the provided path directly
+        model_filename = preload
+        print(f'Using model path: {model_filename}')
+        
+        # Check if file exists
+        file_exists = os.path.exists(model_filename)
+        print(f'Model file exists: {file_exists}')
+        
+        # Load the model
+        if file_exists:
+            print(f'Loading model from {model_filename}')
+            state = torch.load(model_filename, map_location=device)
+            model.load_state_dict(state['model_state_dict'])
+            initial_epoch = state['epoch'] + 1
+            optimizer.load_state_dict(state['optimizer_state_dict'])
+            global_step = state.get('global_step', 0)
+            print(f'Loaded checkpoint. Resuming from epoch {initial_epoch}, global step {global_step}')
+        else:
+            print(f'Model file not found at {model_filename}')
     else:
         print('No model to preload, starting from scratch')
     
@@ -950,15 +997,14 @@ def train_model_single(config, device):
         amp_context = nullcontext()
         scaler = None
     
-    # Early stopping setup
-    early_stopping_enabled = config.get('early_stopping', False)
-    best_metric_value = float('-inf') if config.get('early_stopping_metric', 'bleu') in ['bleu'] else float('inf')
+    # Best model tracking (even if early stopping is disabled)
+    monitored_metric = config.get('early_stopping_metric', 'bleu')
+    best_metric_value = float('-inf') if monitored_metric in ['bleu'] else float('inf')
     patience_counter = 0
-    best_model_filename = None
     
-    print(f"Early stopping: {'enabled' if early_stopping_enabled else 'disabled'}")
-    if early_stopping_enabled:
-        print(f"Monitoring metric: {config.get('early_stopping_metric', 'bleu')}")
+    print(f"Tracking best model based on {monitored_metric} metric")
+    print(f"Early stopping: {'enabled' if config.get('early_stopping', False) else 'disabled'}")
+    if config.get('early_stopping', False):
         print(f"Patience: {config.get('early_stopping_patience', 10)} epochs")
     
     # Gradient accumulation
@@ -1066,7 +1112,7 @@ def train_model_single(config, device):
                     num_display=5
                 )
                 
-                # In kết quả BLEU và các metrics khác
+                # Print validation results
                 if metrics:
                     print("-" * 80)
                     print(f"Validation results at epoch {epoch}:")
@@ -1076,27 +1122,13 @@ def train_model_single(config, device):
                 
                 model.train()  # Switch back to train mode
                 
-                # Save checkpoint at this step if needed
-                if config.get('save_strategy', 'epoch') == 'steps' and global_step % config.get('save_steps', 1000) == 0:
-                    checkpoint_filename = get_weights_file_path(config, f"step_{global_step}")
-                    torch.save({
-                        'epoch': epoch,
-                        'global_step': global_step,
-                        'model_state_dict': model.state_dict(),
-                        'optimizer_state_dict': optimizer.state_dict(),
-                        'scheduler_state_dict': scheduler.state_dict() if scheduler else None,
-                        'metrics': metrics
-                    }, checkpoint_filename)
-                    print(f"Saved checkpoint at step {global_step} to {checkpoint_filename}")
-                
-                # Apply early stopping logic
-                best_metric_value = _apply_early_stopping(
+                # Check for best model and apply early stopping logic
+                best_metric_value, patience_counter, should_stop = _apply_early_stopping(
                     config, metrics, best_metric_value, patience_counter, global_step,
                     model, optimizer, scheduler, epoch
                 )
                 
-                if best_metric_value:
-                    print(f"Early stopping triggered! No improvement for {patience_counter} epochs.")
+                if should_stop:
                     break
         
         # Calculate average training loss for this epoch
@@ -1105,56 +1137,40 @@ def train_model_single(config, device):
         writer.add_scalar('train/average_loss', avg_train_loss, epoch)
         writer.flush()
         
-        # Run validation at the end of every epoch if strategy is 'epoch'
-        if config.get('evaluation_strategy', 'epoch') == 'epoch':
-            model.eval()
-            max_len_val = config.get('max_len', 500)
-            
-            metrics = run_validation(
-                model, val_dataloader, tokenizer_src, tokenizer_tgt, 
-                max_len_val, device, lambda msg: print(msg), 
-                global_step, writer,
-                num_examples=5,
-                num_display=5
-            )
-            
-            # In kết quả BLEU và các metrics khác
-            if metrics:
-                print("-" * 80)
-                print(f"Validation results at epoch {epoch}:")
-                for metric_name, metric_value in metrics.items():
-                    print(f"  {metric_name}: {metric_value:.6f}")
-                print("-" * 80)
-            
-            model.train()  # Switch back to train mode
-            
-            # Save the model at the end of every epoch if strategy is 'epoch'
-            if config.get('save_strategy', 'epoch') == 'epoch':
-                model_filename = get_weights_file_path(config, f"{epoch:02d}")
-                torch.save({
-                    'epoch': epoch,
-                    'global_step': global_step,
-                    'model_state_dict': model.state_dict(),
-                    'optimizer_state_dict': optimizer.state_dict(),
-                    'scheduler_state_dict': scheduler.state_dict() if scheduler else None,
-                    'metrics': metrics
-                }, model_filename)
-                print(f"Saved model at epoch {epoch} to {model_filename}")
-            
-            # Apply early stopping logic
-            should_stop = _apply_early_stopping(
-                config, metrics, best_metric_value, patience_counter, global_step,
-                model, optimizer, scheduler, epoch
-            )
-            
-            if should_stop:
-                print(f"Early stopping triggered! No improvement for {patience_counter} epochs.")
-                break
+        # Run validation at the end of every epoch
+        model.eval()
+        max_len_val = config.get('max_len', 500)
+        
+        metrics = run_validation(
+            model, val_dataloader, tokenizer_src, tokenizer_tgt, 
+            max_len_val, device, lambda msg: print(msg), 
+            global_step, writer,
+            num_examples=5,
+            num_display=5
+        )
+        
+        # Print validation results
+        if metrics:
+            print("-" * 80)
+            print(f"Validation results at epoch {epoch}:")
+            for metric_name, metric_value in metrics.items():
+                print(f"  {metric_name}: {metric_value:.6f}")
+            print("-" * 80)
+        
+        model.train()  # Switch back to train mode
+        
+        # Check for best model and apply early stopping logic
+        best_metric_value, patience_counter, should_stop = _apply_early_stopping(
+            config, metrics, best_metric_value, patience_counter, global_step,
+            model, optimizer, scheduler, epoch
+        )
+        
+        if should_stop:
+            break
     
     print("Training completed!")
-    if early_stopping_enabled and best_model_filename and os.path.exists(best_model_filename):
-        print(f"Best model saved at: {best_model_filename}")
-        print(f"Best validation {config.get('early_stopping_metric', 'bleu')}: {best_metric_value:.6f}")
+    print(f"Best validation {monitored_metric}: {best_metric_value:.6f}")
+    print(f"Best model saved at: {get_weights_file_path(config, 'best')}")
 
 if __name__ == '__main__':
     warnings.filterwarnings("ignore")

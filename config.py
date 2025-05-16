@@ -43,7 +43,7 @@ def get_config():
         "use_mixed_precision": True,  # Sử dụng mixed precision
         
         # Early stopping parameters
-        "early_stopping": False,  # Whether to use early stopping
+        "early_stopping": True,  # Whether to use early stopping
         "early_stopping_patience": 10,  # Number of epochs with no improvement to stop training
         "early_stopping_metric": "bleu",  # Metric to monitor: 'bleu', 'wer', 'cer', or 'loss'
         "early_stopping_min_delta": 0.001,  # Minimum change to be considered as improvement
@@ -54,6 +54,10 @@ def get_config():
         "lang_tgt": "lo",       # Lao
         "model_folder": "vi_lo_weights",
         "model_basename": "tmodel_",
+        
+        # To load a model, set this to the full path of the .pt file
+        # Example: "./VLSP2023_vi_lo_weights/tmodel_best.pt"
+        # Set to None to start from scratch
         "preload": None,
         
         # Paths to the tokenizer models
