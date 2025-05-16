@@ -184,9 +184,8 @@ def run_validation(model, validation_ds, tokenizer_src, tokenizer_tgt, max_len, 
     metrics['cer'] = cer.item()
     
     # Log to TensorBoard if writer exists
-    if writer:
-        writer.add_scalar('validation/cer', cer, global_step)
-        writer.flush()
+    if writer is not None:
+        log_to_tensorboard(writer, 'validation/cer', cer, global_step)
 
     # Compute the word error rate
     metric = WordErrorRate()
@@ -195,9 +194,8 @@ def run_validation(model, validation_ds, tokenizer_src, tokenizer_tgt, max_len, 
     metrics['wer'] = wer.item()
     
     # Log to TensorBoard if writer exists
-    if writer:
-        writer.add_scalar('validation/wer', wer, global_step)
-        writer.flush()
+    if writer is not None:
+        log_to_tensorboard(writer, 'validation/wer', wer, global_step)
 
     # Compute the BLEU metric with properly tokenized input
     try:
@@ -219,9 +217,8 @@ def run_validation(model, validation_ds, tokenizer_src, tokenizer_tgt, max_len, 
         metrics['bleu'] = bleu.item()
         
         # Log to TensorBoard if writer exists
-        if writer:
-            writer.add_scalar('validation/BLEU', bleu, global_step)
-            writer.flush()
+        if writer is not None:
+            log_to_tensorboard(writer, 'validation/BLEU', bleu, global_step, flush=True)
             
     except Exception as e:
         print_msg(f"Error calculating BLEU score: {str(e)}")
@@ -244,14 +241,17 @@ def run_validation(model, validation_ds, tokenizer_src, tokenizer_tgt, max_len, 
             metrics['bleu'] = bleu
             
             # Log to TensorBoard if writer exists
-            if writer:
-                writer.add_scalar('validation/BLEU', bleu, global_step)
-                writer.flush()
+            if writer is not None:
+                log_to_tensorboard(writer, 'validation/BLEU', bleu, global_step, flush=True)
                 
         except Exception as e2:
             print_msg(f"Fallback BLEU calculation also failed: {str(e2)}")
             metrics['bleu'] = 0.0
-    
+
+    # Flush writer at the end
+    if writer is not None:
+        writer.flush()
+
     return metrics
 
 def get_ds(config, tokenizer_src=None, tokenizer_tgt=None, is_distributed=False, rank=0, world_size=1):
@@ -371,6 +371,26 @@ def get_autocast_context(use_mixed_precision=False):
         # Return a dummy context manager that does nothing
         from contextlib import nullcontext
         return nullcontext()
+
+def log_to_tensorboard(writer, tag, value, step, flush=False):
+    """Helper function to consistently log metrics to TensorBoard
+    
+    Args:
+        writer: The TensorBoard SummaryWriter
+        tag: The tag/name for the metric
+        value: The value to log (will extract .item() if it's a tensor)
+        step: The global step
+        flush: Whether to flush after logging
+    """
+    if writer is not None:
+        # Extract .item() from tensors to avoid potential CUDA synchronization issues
+        if hasattr(value, 'item'):
+            value = value.item()
+        
+        writer.add_scalar(tag, value, step)
+        
+        if flush:
+            writer.flush()
 
 def train_model_distributed(rank, world_size, config):
     """Train the model in distributed mode.
@@ -632,9 +652,8 @@ def train_model_distributed(rank, world_size, config):
             
             # Log metrics on main process
             if rank == 0 and writer is not None:
-                writer.add_scalar('train/loss', full_loss, global_step)
-                writer.add_scalar('train/learning_rate', scheduler.get_last_lr()[0], global_step)
-                writer.flush()
+                log_to_tensorboard(writer, 'train/loss', full_loss, global_step)
+                log_to_tensorboard(writer, 'train/learning_rate', scheduler.get_last_lr()[0], global_step, flush=True)
             
             global_step += 1
             
@@ -691,9 +710,7 @@ def train_model_distributed(rank, world_size, config):
         
         if rank == 0:
             print(f"Epoch {epoch:02d} - Average training loss: {avg_train_loss:.4f}")
-            if writer is not None:
-                writer.add_scalar('train/average_loss', avg_train_loss, epoch)
-                writer.flush()
+            log_to_tensorboard(writer, 'train/average_loss', avg_train_loss, epoch, flush=True)
 
         # Run validation at the end of every epoch if strategy is epoch
         if rank == 0 and config.get('evaluation_strategy', 'epoch') == 'epoch':
@@ -754,6 +771,10 @@ def train_model_distributed(rank, world_size, config):
         if early_stopping_enabled and best_model_filename and os.path.exists(best_model_filename):
             print(f"Best model saved at: {best_model_filename}")
             print(f"Best validation {config.get('early_stopping_metric', 'bleu')}: {best_metric_value:.6f}")
+            
+        # Properly close the TensorBoard writer
+        if writer is not None:
+            writer.close()
 
 def _apply_early_stopping(config, metrics, best_metric_value, patience_counter, global_step,
                           model, optimizer, scheduler, epoch):
@@ -1093,9 +1114,8 @@ def train_model_single(config, device):
             })
             
             # Log metrics
-            writer.add_scalar('train/loss', full_loss, global_step)
-            writer.add_scalar('train/learning_rate', scheduler.get_last_lr()[0], global_step)
-            writer.flush()
+            log_to_tensorboard(writer, 'train/loss', full_loss, global_step)
+            log_to_tensorboard(writer, 'train/learning_rate', scheduler.get_last_lr()[0], global_step, flush=True)
             
             global_step += 1
             
@@ -1134,9 +1154,8 @@ def train_model_single(config, device):
         # Calculate average training loss for this epoch
         avg_train_loss = total_loss / batch_count
         print(f"Epoch {epoch:02d} - Average training loss: {avg_train_loss:.4f}")
-        writer.add_scalar('train/average_loss', avg_train_loss, epoch)
-        writer.flush()
-        
+        log_to_tensorboard(writer, 'train/average_loss', avg_train_loss, epoch, flush=True)
+
         # Run validation at the end of every epoch
         model.eval()
         max_len_val = config.get('max_len', 500)
@@ -1171,6 +1190,10 @@ def train_model_single(config, device):
     print("Training completed!")
     print(f"Best validation {monitored_metric}: {best_metric_value:.6f}")
     print(f"Best model saved at: {get_weights_file_path(config, 'best')}")
+    
+    # Properly close the TensorBoard writer
+    if writer is not None:
+        writer.close()
 
 if __name__ == '__main__':
     warnings.filterwarnings("ignore")

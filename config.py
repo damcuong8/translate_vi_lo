@@ -58,7 +58,7 @@ def get_config():
         # To load a model, set this to the full path of the .pt file
         # Example: "./VLSP2023_vi_lo_weights/tmodel_best.pt"
         # Set to None to start from scratch
-        "preload": None,
+        "preload": "/kaggle/input/MNT_vi_lo/tmodel_best.pt",
         
         # Paths to the tokenizer models
         "tokenizer_src_path": "./vi_lo_weights/tokenizer_vi.model",  # Path to Vietnamese tokenizer
