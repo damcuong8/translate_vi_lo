@@ -10,18 +10,18 @@ def get_config():
         "max_len": 500,
         
         # Tham số mô hình
-        "d_model": 384,
+        "d_model": 512,
         "num_layers": 4,
         "num_heads": 8,
-        "dropout": 0.15,
-        "d_ff": 1536,
+        "dropout": 0.1,
+        "d_ff": 2048,
         
 
         "weight_decay": 0.0001,  # L2 regularization
         "label_smoothing": 0.1,  # Label smoothing
         "lr_scheduler": "cosine",
         "warmup_steps": 4000,
-        "gradient_clip_val": 1.0,  # Gradient clipping
+        "gradient_clip_val": 2.0,  # Gradient clipping
         
         # Distributed training parameters
         "distributed_training": False,  # Bật distributed training
@@ -38,6 +38,8 @@ def get_config():
         "save_steps": 1000,
         "evaluation_strategy": "epoch",
         "eval_steps": 1000,
+        "save_only_best": True,  # Only save best model, not epoch models
+        "keep_checkpoint_max": 1,  # Maximum number of checkpoints to keep (applies to epoch models if enabled)
         
         # Mixed precision training
         "use_mixed_precision": True,  # Sử dụng mixed precision

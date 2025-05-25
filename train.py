@@ -541,25 +541,30 @@ def train_model_distributed(rank, world_size, config):
         amp_context = nullcontext()
         scaler = None
 
-    # Early stopping setup (only track on main process)
-    early_stopping_enabled = config.get('early_stopping', False)
-    best_metric_value = float('-inf') if config.get('early_stopping_metric', 'bleu') in ['bleu'] else float('inf')
+    # Best model tracking (even if early stopping is disabled)
+    monitored_metric = config.get('early_stopping_metric', 'bleu')
+    best_metric_value = float('-inf') if monitored_metric in ['bleu'] else float('inf')
     patience_counter = 0
-    best_model_filename = None
     
-    if rank == 0:
-        print(f"Early stopping: {'enabled' if early_stopping_enabled else 'disabled'}")
-        if early_stopping_enabled:
-            print(f"Monitoring metric: {config.get('early_stopping_metric', 'bleu')}")
-            print(f"Patience: {config.get('early_stopping_patience', 3)} epochs")
+    print(f"Tracking best model based on {monitored_metric} metric")
+    print(f"Early stopping: {'enabled' if config.get('early_stopping', False) else 'disabled'}")
+    if config.get('early_stopping', False):
+        print(f"Patience: {config.get('early_stopping_patience', 10)} epochs")
     
-    # Gradient accumulation steps
+    # Model saving strategy
+    save_only_best = config.get('save_only_best', False)
+    print(f"Model saving strategy: {'Only best models' if save_only_best else 'Best + epoch models'}")
+    if save_only_best:
+        print("  - Only the latest best model will be saved")
+        print("  - Previous best models will be automatically removed")
+    else:
+        print("  - Both best models and epoch models will be saved")
+        print(f"  - Maximum checkpoints to keep: {config.get('keep_checkpoint_max', 'unlimited')}")
+    
+    # Gradient accumulation
     grad_accum_steps = config.get('gradient_accumulation_steps', 1)
-    effective_batch_size = config['batch_size'] * world_size * grad_accum_steps
-    
-    if rank == 0:
-        print(f"Gradient accumulation steps: {grad_accum_steps}")
-        print(f"Effective batch size: {effective_batch_size}")
+    print(f"Gradient accumulation steps: {grad_accum_steps}")
+    print(f"Effective batch size: {config['batch_size'] * grad_accum_steps}")
     
     # Training loop
     for epoch in range(initial_epoch, config['num_epochs']):
@@ -736,7 +741,7 @@ def train_model_distributed(rank, world_size, config):
             model.train()  # Switch back to train mode
 
             # Save the model at the end of every epoch if strategy is epoch
-            if config.get('save_strategy', 'epoch') == 'epoch':
+            if config.get('save_strategy', 'epoch') == 'epoch' and not config.get('save_only_best', False):
                 model_filename = get_weights_file_path(config, f"{epoch:02d}")
                 torch.save({
                     'epoch': epoch,
@@ -747,6 +752,8 @@ def train_model_distributed(rank, world_size, config):
                     'metrics': metrics
                 }, model_filename)
                 print(f"Rank {rank}: Saved model at epoch {epoch} to {model_filename}")
+            elif config.get('save_only_best', False):
+                print(f"Epoch {epoch}: Only saving best models (save_only_best=True)")
             
             # Apply early stopping logic
             should_stop = _apply_early_stopping(
@@ -768,9 +775,8 @@ def train_model_distributed(rank, world_size, config):
     
     if rank == 0:
         print("Training completed!")
-        if early_stopping_enabled and best_model_filename and os.path.exists(best_model_filename):
-            print(f"Best model saved at: {best_model_filename}")
-            print(f"Best validation {config.get('early_stopping_metric', 'bleu')}: {best_metric_value:.6f}")
+        if best_metric_value and os.path.exists(get_weights_file_path(config, 'best')):
+            print(f"Best validation {monitored_metric}: {best_metric_value:.6f}")
             
         # Properly close the TensorBoard writer
         if writer is not None:
@@ -807,8 +813,18 @@ def _apply_early_stopping(config, metrics, best_metric_value, patience_counter, 
                 # Flag this as best model
                 is_best_model = True
                 
-                # Save the best model (regardless of early stopping being enabled)
+                # Get the path for the best model
                 best_model_filename = get_weights_file_path(config, "best")
+                
+                # Remove old best model if it exists
+                if os.path.exists(best_model_filename):
+                    try:
+                        os.remove(best_model_filename)
+                        print(f"Removed old best model: {best_model_filename}")
+                    except Exception as e:
+                        print(f"Warning: Could not remove old best model: {e}")
+                
+                # Save the new best model
                 torch.save({
                     'epoch': epoch,
                     'global_step': global_step,
@@ -820,17 +836,6 @@ def _apply_early_stopping(config, metrics, best_metric_value, patience_counter, 
                 }, best_model_filename)
                 print(f"Saved new best model to {best_model_filename}")
                 
-                # Also save with epoch number for reference
-                numbered_model_filename = get_weights_file_path(config, f"best_epoch_{epoch:02d}")
-                torch.save({
-                    'epoch': epoch,
-                    'global_step': global_step,
-                    'model_state_dict': model.state_dict(),
-                    'optimizer_state_dict': optimizer.state_dict(),
-                    'scheduler_state_dict': scheduler.state_dict() if scheduler else None,
-                    'metrics': metrics,
-                    'best_metric': {monitored_metric: current_metric_value}
-                }, numbered_model_filename)
             else:
                 # Increment patience counter if early stopping is enabled
                 if config.get('early_stopping', False):
@@ -1027,6 +1032,16 @@ def train_model_single(config, device):
     print(f"Early stopping: {'enabled' if config.get('early_stopping', False) else 'disabled'}")
     if config.get('early_stopping', False):
         print(f"Patience: {config.get('early_stopping_patience', 10)} epochs")
+    
+    # Model saving strategy
+    save_only_best = config.get('save_only_best', False)
+    print(f"Model saving strategy: {'Only best models' if save_only_best else 'Best + epoch models'}")
+    if save_only_best:
+        print("  - Only the latest best model will be saved")
+        print("  - Previous best models will be automatically removed")
+    else:
+        print("  - Both best models and epoch models will be saved")
+        print(f"  - Maximum checkpoints to keep: {config.get('keep_checkpoint_max', 'unlimited')}")
     
     # Gradient accumulation
     grad_accum_steps = config.get('gradient_accumulation_steps', 1)
