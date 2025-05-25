@@ -628,11 +628,9 @@ def train_model_distributed(rank, world_size, config):
 
             # Forward pass with autocast for mixed precision
             with amp_context:
-                # For DataParallel, call the model directly - DO NOT use model.module
-                # DataParallel will automatically handle splitting across GPUs
-                encoder_output = model.encode(encoder_input, encoder_mask)
-                decoder_output = model.decode(encoder_output, encoder_mask, decoder_input, decoder_mask)
-                proj_output = model.project(decoder_output)
+                # For DataParallel, use the complete forward_training method
+                # This will automatically handle splitting across GPUs
+                proj_output = model.forward_training(encoder_input, encoder_mask, decoder_input, decoder_mask)
                 
                 # Compute loss
                 loss = loss_fn(proj_output.view(-1, tokenizer_tgt.vocab_size()), label.view(-1)) * loss_factor
@@ -881,38 +879,52 @@ def _apply_early_stopping(config, metrics, best_metric_value, patience_counter, 
 class DataParallelTransformer(DP):
     """
     Custom DataParallel wrapper for Transformer model that properly handles
-    custom methods like encode, decode, and project
+    the training forward pass for transformer models
     """
-    def encode(self, src, src_mask):
-        # For encode, we can use the standard DataParallel forward mechanism
-        # by temporarily replacing the forward method
+    def forward_training(self, encoder_input, encoder_mask, decoder_input, decoder_mask):
+        """
+        Complete forward pass for training that can be parallelized
+        Returns: proj_output (for loss calculation)
+        """
+        # Create a temporary forward function that does the complete training pass
+        def training_forward(enc_input, enc_mask, dec_input, dec_mask):
+            encoder_output = self.module.encode(enc_input, enc_mask)
+            decoder_output = self.module.decode(encoder_output, enc_mask, dec_input, dec_mask)
+            proj_output = self.module.project(decoder_output)
+            return proj_output
+        
+        # Temporarily replace the forward method
         original_forward = self.module.forward
-        self.module.forward = self.module.encode
+        self.module.forward = training_forward
         try:
-            result = super().forward(src, src_mask)
+            # Use DataParallel's forward mechanism
+            result = super().forward(encoder_input, encoder_mask, decoder_input, decoder_mask)
         finally:
+            # Restore original forward method
             self.module.forward = original_forward
+        
         return result
+    
+    def encode(self, src, src_mask):
+        """For validation/inference - single method call"""
+        if hasattr(self, 'module'):
+            return self.module.encode(src, src_mask)
+        else:
+            return super().encode(src, src_mask)
     
     def decode(self, encoder_output, src_mask, tgt, tgt_mask):
-        # For decode, we use the same approach
-        original_forward = self.module.forward
-        self.module.forward = self.module.decode
-        try:
-            result = super().forward(encoder_output, src_mask, tgt, tgt_mask)
-        finally:
-            self.module.forward = original_forward
-        return result
+        """For validation/inference - single method call"""
+        if hasattr(self, 'module'):
+            return self.module.decode(encoder_output, src_mask, tgt, tgt_mask)
+        else:
+            return super().decode(encoder_output, src_mask, tgt, tgt_mask)
     
     def project(self, x):
-        # For project, we use the same approach
-        original_forward = self.module.forward
-        self.module.forward = self.module.project
-        try:
-            result = super().forward(x)
-        finally:
-            self.module.forward = original_forward
-        return result
+        """For validation/inference - single method call"""
+        if hasattr(self, 'module'):
+            return self.module.project(x)
+        else:
+            return super().project(x)
 
 def train_model_dataparallel(config, device_ids=None):
     """Train model using DataParallel on multiple GPUs
@@ -1089,11 +1101,9 @@ def train_model_dataparallel(config, device_ids=None):
             
             # Forward pass with autocast for mixed precision
             with amp_context:
-                # For DataParallel, call the model directly - DO NOT use model.module
-                # DataParallel will automatically handle splitting across GPUs
-                encoder_output = model.encode(encoder_input, encoder_mask)
-                decoder_output = model.decode(encoder_output, encoder_mask, decoder_input, decoder_mask)
-                proj_output = model.project(decoder_output)
+                # For DataParallel, use the complete forward_training method
+                # This will automatically handle splitting across GPUs
+                proj_output = model.forward_training(encoder_input, encoder_mask, decoder_input, decoder_mask)
                 
                 # Compute loss
                 loss = loss_fn(proj_output.view(-1, tokenizer_tgt.vocab_size()), label.view(-1)) * loss_factor
@@ -1470,9 +1480,9 @@ def train_model_single(config, device):
             
             # Forward pass with autocast for mixed precision
             with amp_context:
-                encoder_output = model.encode(encoder_input, encoder_mask)
-                decoder_output = model.decode(encoder_output, encoder_mask, decoder_input, decoder_mask)
-                proj_output = model.project(decoder_output)
+                # For DataParallel, use the complete forward_training method
+                # This will automatically handle splitting across GPUs
+                proj_output = model.forward_training(encoder_input, encoder_mask, decoder_input, decoder_mask)
                 
                 # Compute loss
                 loss = loss_fn(proj_output.view(-1, tokenizer_tgt.vocab_size()), label.view(-1)) * loss_factor
