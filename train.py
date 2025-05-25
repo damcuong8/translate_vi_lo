@@ -14,6 +14,7 @@ import time
 import torch.distributed as dist
 import torch.multiprocessing as mp
 from torch.nn.parallel import DistributedDataParallel as DDP
+from torch.nn.parallel import DataParallel as DP
 from torch.utils.data.distributed import DistributedSampler
 
 import warnings
@@ -34,7 +35,7 @@ def greedy_decode(model, source, source_mask, tokenizer_src, tokenizer_tgt, max_
     Performs greedy decoding on the input source sentence.
     
     Args:
-        model: The model to use for decoding (can be standard model or DDP wrapped model)
+        model: The model to use for decoding (can be standard model, DDP wrapped model, or DP wrapped model)
         source: The source tensor
         source_mask: The source mask tensor
         tokenizer_src: The source tokenizer
@@ -45,9 +46,9 @@ def greedy_decode(model, source, source_mask, tokenizer_src, tokenizer_tgt, max_
     Returns:
         The decoded output tensor
     """
-    # Check if the model is wrapped in DDP
+    # Check if the model is wrapped in DDP or DP
     if hasattr(model, 'module'):
-        # Use model.module for DDP models
+        # Use model.module for DDP and DP models
         return _greedy_decode_internal(model.module, source, source_mask, tokenizer_src, tokenizer_tgt, max_len, device)
     else:
         # Use model directly for standard models
@@ -849,88 +850,410 @@ def _apply_early_stopping(config, metrics, best_metric_value, patience_counter, 
     
     return best_metric_value, patience_counter, should_stop
 
+def train_model_dataparallel(config, device_ids=None):
+    """Train model using DataParallel on multiple GPUs
+    
+    Args:
+        config: Training configuration
+        device_ids: List of GPU device IDs to use (e.g., [0, 1])
+    """
+    if device_ids is None:
+        device_ids = list(range(torch.cuda.device_count()))
+    
+    print(f"Using DataParallel training on GPUs: {device_ids}")
+    
+    # Primary device is the first GPU
+    device = torch.device(f'cuda:{device_ids[0]}')
+    
+    # Make sure the weights folder exists
+    Path(f"{config['datasource']}_{config['model_folder']}").mkdir(parents=True, exist_ok=True)
+    
+    # Get datasets and tokenizers (no distributed sampler needed for DataParallel)
+    train_dataloader, val_dataloader, tokenizer_src, tokenizer_tgt, _ = get_ds(
+        config, 
+        is_distributed=False,  # DataParallel doesn't need distributed sampling
+        rank=0, 
+        world_size=1
+    )
+    
+    # Create model and move to primary device
+    model = get_model(config, tokenizer_src.vocab_size(), tokenizer_tgt.vocab_size(), device)
+    
+    # Wrap model in DataParallel
+    if len(device_ids) > 1:
+        model = DP(model, device_ids=device_ids)
+        print(f"Model wrapped in DataParallel with devices: {device_ids}")
+    else:
+        print("Only one GPU specified, using single GPU training")
+    
+    # TensorBoard writer
+    writer = SummaryWriter(config['experiment_name'])
+    
+    # Optimizer
+    optimizer = torch.optim.AdamW(
+        model.parameters(), 
+        lr=config['lr'], 
+        eps=1e-9,
+        weight_decay=config.get('weight_decay', 0.01)
+    )
+    
+    # Preload model if requested
+    initial_epoch = 0
+    global_step = 0
+    preload = config['preload']
+    
+    print(f'Preload value: {preload}')
+    
+    if preload and os.path.exists(preload):
+        model_filename = preload
+        print(f'Loading model from {model_filename}')
+        
+        state = torch.load(model_filename, map_location=device)
+        
+        # Handle loading state dict for DataParallel models
+        if isinstance(model, DP):
+            # If the saved model was not DataParallel, we need to load into model.module
+            if any(key.startswith('module.') for key in state['model_state_dict'].keys()):
+                model.load_state_dict(state['model_state_dict'])
+            else:
+                # Add 'module.' prefix to keys
+                new_state_dict = {}
+                for key, value in state['model_state_dict'].items():
+                    new_state_dict[f'module.{key}'] = value
+                model.load_state_dict(new_state_dict)
+        else:
+            # Regular model loading
+            if any(key.startswith('module.') for key in state['model_state_dict'].keys()):
+                # Remove 'module.' prefix from keys
+                new_state_dict = {}
+                for key, value in state['model_state_dict'].items():
+                    if key.startswith('module.'):
+                        new_state_dict[key[7:]] = value  # Remove 'module.' prefix
+                    else:
+                        new_state_dict[key] = value
+                model.load_state_dict(new_state_dict)
+            else:
+                model.load_state_dict(state['model_state_dict'])
+        
+        initial_epoch = state['epoch'] + 1
+        optimizer.load_state_dict(state['optimizer_state_dict'])
+        global_step = state.get('global_step', 0)
+        print(f'Loaded checkpoint. Resuming from epoch {initial_epoch}, global step {global_step}')
+    else:
+        print('No model to preload, starting from scratch')
+    
+    # Learning rate scheduler
+    total_steps = len(train_dataloader) * config['num_epochs']
+    warmup_steps = config.get('warmup_steps', 4000)
+    
+    def lr_lambda(step):
+        if step < warmup_steps:
+            return float(step) / float(max(1, warmup_steps))
+        return 0.5 * (1.0 + math.cos(math.pi * (step - warmup_steps) / max(1, (total_steps - warmup_steps))))
+    
+    scheduler = LambdaLR(optimizer, lr_lambda)
+    
+    # Loss function
+    pad_idx = tokenizer_src.piece_to_id("<pad>")
+    loss_fn = nn.CrossEntropyLoss(
+        ignore_index=pad_idx, 
+        label_smoothing=config.get('label_smoothing', 0.1)
+    ).to(device)
+    
+    # Mixed precision setup
+    use_mixed_precision = config.get('use_mixed_precision', True) and device.type == 'cuda'
+    
+    if use_mixed_precision:
+        from torch.amp import autocast, GradScaler
+        amp_context = autocast(device_type='cuda')
+        scaler = GradScaler()
+        print("Using mixed precision training")
+    else:
+        from contextlib import nullcontext
+        amp_context = nullcontext()
+        scaler = None
+    
+    # Best model tracking
+    monitored_metric = config.get('early_stopping_metric', 'bleu')
+    best_metric_value = float('-inf') if monitored_metric in ['bleu'] else float('inf')
+    patience_counter = 0
+    
+    print(f"Tracking best model based on {monitored_metric} metric")
+    print(f"Early stopping: {'enabled' if config.get('early_stopping', False) else 'disabled'}")
+    if config.get('early_stopping', False):
+        print(f"Patience: {config.get('early_stopping_patience', 10)} epochs")
+    
+    # Model saving strategy
+    save_only_best = config.get('save_only_best', False)
+    print(f"Model saving strategy: {'Only best models' if save_only_best else 'Best + epoch models'}")
+    
+    # Gradient accumulation
+    grad_accum_steps = config.get('gradient_accumulation_steps', 1)
+    print(f"Gradient accumulation steps: {grad_accum_steps}")
+    print(f"Effective batch size: {config['batch_size'] * grad_accum_steps}")
+    
+    # Training loop
+    for epoch in range(initial_epoch, config['num_epochs']):
+        # Clear GPU cache
+        torch.cuda.empty_cache()
+        
+        # Set model to training mode
+        model.train()
+        
+        # Create progress bar
+        progress = tqdm(train_dataloader, desc=f"Epoch {epoch:02d}")
+        
+        # Training metrics
+        total_loss = 0.0
+        batch_count = 0
+        
+        # Reset optimizer gradients
+        optimizer.zero_grad(set_to_none=True)
+        
+        for i, batch in enumerate(progress):
+            batch_count += 1
+            
+            # Move batch to device
+            encoder_input = batch['encoder_input'].to(device)
+            decoder_input = batch['decoder_input'].to(device)
+            encoder_mask = batch['encoder_mask'].to(device)
+            decoder_mask = batch['decoder_mask'].to(device)
+            label = batch['label'].to(device)
+            
+            # Calculate loss with gradient accumulation
+            loss_factor = 1.0 / grad_accum_steps
+            
+            # Forward pass with autocast for mixed precision
+            with amp_context:
+                # Handle DataParallel model access
+                if isinstance(model, DP):
+                    encoder_output = model.module.encode(encoder_input, encoder_mask)
+                    decoder_output = model.module.decode(encoder_output, encoder_mask, decoder_input, decoder_mask)
+                    proj_output = model.module.project(decoder_output)
+                else:
+                    encoder_output = model.encode(encoder_input, encoder_mask)
+                    decoder_output = model.decode(encoder_output, encoder_mask, decoder_input, decoder_mask)
+                    proj_output = model.project(decoder_output)
+                
+                # Compute loss
+                loss = loss_fn(proj_output.view(-1, tokenizer_tgt.vocab_size()), label.view(-1)) * loss_factor
+            
+            # Backward pass with gradient scaling if using mixed precision
+            if use_mixed_precision:
+                scaler.scale(loss).backward()
+            else:
+                loss.backward()
+            
+            # Update weights if we reached the accumulation steps
+            if (i + 1) % grad_accum_steps == 0 or (i + 1) == len(train_dataloader):
+                if use_mixed_precision:
+                    # Unscale gradients for clipping
+                    scaler.unscale_(optimizer)
+                    
+                # Gradient clipping
+                torch.nn.utils.clip_grad_norm_(model.parameters(), config.get('gradient_clip_val', 1.0))
+                
+                if use_mixed_precision:
+                    # Update weights with scaled gradients
+                    scaler.step(optimizer)
+                    scaler.update()
+                else:
+                    # Update weights
+                    optimizer.step()
+                
+                # Update learning rate
+                scheduler.step()
+                
+                # Reset gradients
+                optimizer.zero_grad(set_to_none=True)
+            
+            # Accumulate full loss for logging
+            full_loss = loss.item() * grad_accum_steps
+            total_loss += full_loss
+            
+            # Update progress bar
+            progress.set_postfix({
+                "loss": f"{full_loss:6.3f}",
+                "lr": f"{scheduler.get_last_lr()[0]:.1e}"
+            })
+            
+            # Log metrics
+            log_to_tensorboard(writer, 'train/loss', full_loss, global_step)
+            log_to_tensorboard(writer, 'train/learning_rate', scheduler.get_last_lr()[0], global_step, flush=True)
+            
+            global_step += 1
+            
+            # Run validation if needed based on steps
+            if config.get('evaluation_strategy', 'epoch') == 'steps' and global_step % config.get('eval_steps', 1000) == 0:
+                model.eval()
+                max_len_val = config.get('max_len', 500)
+                
+                metrics = run_validation(
+                    model, val_dataloader, tokenizer_src, tokenizer_tgt, 
+                    max_len_val, device, lambda msg: print(msg), 
+                    global_step, writer,
+                    num_examples=5,
+                    num_display=5
+                )
+                
+                if metrics:
+                    print("-" * 80)
+                    print(f"Validation results at step {global_step}:")
+                    for metric_name, metric_value in metrics.items():
+                        print(f"  {metric_name}: {metric_value:.6f}")
+                    print("-" * 80)
+                
+                model.train()  # Switch back to train mode
+                
+                # Check for best model and apply early stopping logic
+                actual_model = model.module if isinstance(model, DP) else model
+                best_metric_value, patience_counter, should_stop = _apply_early_stopping(
+                    config, metrics, best_metric_value, patience_counter, global_step,
+                    actual_model, optimizer, scheduler, epoch
+                )
+                
+                if should_stop:
+                    break
+        
+        # Calculate average training loss for this epoch
+        avg_train_loss = total_loss / batch_count
+        print(f"Epoch {epoch:02d} - Average training loss: {avg_train_loss:.4f}")
+        log_to_tensorboard(writer, 'train/average_loss', avg_train_loss, epoch, flush=True)
+
+        # Run validation at the end of every epoch
+        if config.get('evaluation_strategy', 'epoch') == 'epoch':
+            model.eval()
+            max_len_val = config.get('max_len', 500)
+            
+            metrics = run_validation(
+                model, val_dataloader, tokenizer_src, tokenizer_tgt, 
+                max_len_val, device, lambda msg: print(msg), 
+                global_step, writer,
+                num_examples=5,
+                num_display=5
+            )
+            
+            if metrics:
+                print("-" * 80)
+                print(f"Validation results at epoch {epoch}:")
+                for metric_name, metric_value in metrics.items():
+                    print(f"  {metric_name}: {metric_value:.6f}")
+                print("-" * 80)
+            
+            model.train()  # Switch back to train mode
+            
+            # Save the model at the end of every epoch if strategy is epoch
+            if config.get('save_strategy', 'epoch') == 'epoch' and not config.get('save_only_best', False):
+                model_filename = get_weights_file_path(config, f"{epoch:02d}")
+                # Get the actual model state dict
+                actual_model = model.module if isinstance(model, DP) else model
+                torch.save({
+                    'epoch': epoch,
+                    'global_step': global_step,
+                    'model_state_dict': actual_model.state_dict(),
+                    'optimizer_state_dict': optimizer.state_dict(),
+                    'scheduler_state_dict': scheduler.state_dict() if scheduler else None,
+                    'metrics': metrics
+                }, model_filename)
+                print(f"Saved model at epoch {epoch} to {model_filename}")
+            
+            # Check for best model and apply early stopping logic
+            actual_model = model.module if isinstance(model, DP) else model
+            best_metric_value, patience_counter, should_stop = _apply_early_stopping(
+                config, metrics, best_metric_value, patience_counter, global_step,
+                actual_model, optimizer, scheduler, epoch
+            )
+            
+            if should_stop:
+                print(f"Early stopping triggered! No improvement for {patience_counter} epochs.")
+                break
+    
+    print("Training completed!")
+    print(f"Best validation {monitored_metric}: {best_metric_value:.6f}")
+    print(f"Best model saved at: {get_weights_file_path(config, 'best')}")
+    
+    # Properly close the TensorBoard writer
+    if writer is not None:
+        writer.close()
+
 def train_model(config=None):
     """Main entry point for training"""
     if config is None:
         config = get_config()
     
-    # Check if we should use distributed training
-    use_distributed = config.get('distributed_training', False)
-    
     # Check available GPUs
-    world_size = min(config.get('num_gpus', 1), torch.cuda.device_count()) if torch.cuda.is_available() else 1
+    num_gpus = torch.cuda.device_count() if torch.cuda.is_available() else 0
     
     # Check if we're running on Kaggle
     is_kaggle = os.path.exists('/kaggle')
     
-    # Force single GPU if specified in config
+    # Get training mode preference
+    training_mode = config.get('training_mode', 'auto')  # 'auto', 'single', 'dataparallel', 'distributed'
     force_single_gpu = config.get('force_single_gpu', False)
-    if force_single_gpu:
-        print("Forcing single GPU training as specified in config")
-        world_size = 1
-        use_distributed = False
     
-    if is_kaggle:
-        print("Detected Kaggle environment. Adjusting distributed training settings.")
-        # Set shorter timeout, lower batch size if needed
-        os.environ['NCCL_BLOCKING_WAIT'] = '1'  # Use blocking wait for better stability
-        os.environ['NCCL_SOCKET_IFNAME'] = 'lo'  # Use loopback interface
-        os.environ['NCCL_DEBUG'] = 'WARN'  # Set debug level
-        # Increase timeout for NCCL operations (default is 30 minutes/1800000 ms)
-        os.environ['NCCL_TIMEOUT'] = str(config.get('nccl_timeout', 3600000))  # 1 hour default
+    print(f"Available GPUs: {num_gpus}")
+    print(f"Training mode: {training_mode}")
+    print(f"Kaggle environment: {is_kaggle}")
+    
+    if force_single_gpu or num_gpus <= 1:
+        print("Using single GPU/CPU training")
+        device = torch.device('cuda:0' if torch.cuda.is_available() else 'cpu')
+        train_model_single(config, device)
+        return
+    
+    # Multi-GPU training logic
+    if training_mode == 'dataparallel' or (training_mode == 'auto' and is_kaggle):
+        # Use DataParallel for Kaggle or when explicitly requested
+        device_ids = list(range(min(num_gpus, config.get('num_gpus', num_gpus))))
+        print(f"Using DataParallel training on GPUs: {device_ids}")
+        train_model_dataparallel(config, device_ids)
+        return
+    
+    elif training_mode == 'distributed' or (training_mode == 'auto' and not is_kaggle):
+        # Use DistributedDataParallel for non-Kaggle environments or when explicitly requested
+        use_distributed = config.get('distributed_training', True)
+        world_size = min(config.get('num_gpus', num_gpus), num_gpus)
         
-        # Try distributed, but be ready to fall back
-        try_distributed = use_distributed and world_size > 1 and not force_single_gpu
-    else:
-        # Increase timeout for NCCL operations
-        os.environ['NCCL_TIMEOUT'] = str(config.get('nccl_timeout', 3600000))  # 1 hour default
-        try_distributed = use_distributed and world_size > 1 and not force_single_gpu
+        if use_distributed and world_size > 1:
+            try:
+                print(f"Attempting DistributedDataParallel training on {world_size} GPUs...")
+                
+                # Set environment variables
+                os.environ['NCCL_TIMEOUT'] = str(config.get('nccl_timeout', 3600000))
+                
+                # Try distributed training
+                mp.start_method = 'spawn'
+                process_context = mp.spawn(
+                    train_model_distributed,
+                    args=(world_size, config),
+                    nprocs=world_size,
+                    join=False
+                )
+                
+                # Wait for completion with timeout check
+                start_time = time.time()
+                early_failure_timeout = 60
+                
+                while time.time() - start_time < early_failure_timeout:
+                    if not all(process.is_alive() for process in process_context.processes):
+                        raise Exception("One of the distributed processes failed to start properly")
+                    time.sleep(1)
+                
+                process_context.join()
+                print("DistributedDataParallel training completed successfully!")
+                return
+                
+            except Exception as e:
+                print(f"DistributedDataParallel training failed: {str(e)}")
+                print("Falling back to DataParallel training...")
+                device_ids = list(range(min(num_gpus, config.get('num_gpus', num_gpus))))
+                train_model_dataparallel(config, device_ids)
+                return
     
-    # Try distributed training first if applicable
-    if try_distributed:
-        try:
-            print(f"Attempting distributed training on {world_size} GPUs...")
-            # Set a timeout for the multiprocessing spawn to catch issues early
-            mp.start_method = 'spawn'
-            
-            # Try distributed training with a timeout
-            process_context = mp.spawn(
-                train_model_distributed,
-                args=(world_size, config),
-                nprocs=world_size,
-                join=False  # Don't wait for completion
-            )
-            
-            # Set a timeout (30 seconds) to detect early failures
-            start_time = time.time()
-            early_failure_timeout = 60  # seconds
-            
-            # Check if processes fail early
-            while time.time() - start_time < early_failure_timeout:
-                if not all(process.is_alive() for process in process_context.processes):
-                    raise Exception("One of the distributed processes failed to start properly")
-                time.sleep(1)
-            
-            # If we reach here, processes seem stable - wait for completion
-            process_context.join()
-            print("Distributed training completed successfully!")
-            return
-            
-        except Exception as e:
-            print(f"Distributed training failed with error: \n{str(e)}")
-            print("Falling back to single GPU training...")
-    
-    # If distributed training failed or wasn't attempted, use single GPU training
-    if world_size >= 1 and torch.cuda.is_available():
-        print(f"Using single GPU training on GPU 0")
-        # Use GPU 0 only
-        device = torch.device('cuda:0')
-        train_model_single(config, device)
-    else:
-        print("Using CPU training")
-        # Use CPU
-        device = torch.device('cpu')
-        train_model_single(config, device)
+    # Fallback to single GPU training
+    print("Falling back to single GPU training")
+    device = torch.device('cuda:0' if torch.cuda.is_available() else 'cpu')
+    train_model_single(config, device)
 
 def train_model_single(config, device):
     """Train model on a single device (CPU or one GPU)"""

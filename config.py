@@ -23,9 +23,15 @@ def get_config():
         "warmup_steps": 4000,
         "gradient_clip_val": 2.0,  # Gradient clipping
         
-        # Distributed training parameters
-        "distributed_training": False,  # Bật distributed training
-        "force_single_gpu": True,  # Set to True to force single GPU training
+        # Multi-GPU training parameters
+        "training_mode": "auto",  # 'auto', 'single', 'dataparallel', 'distributed'
+                                  # - 'auto': Use DataParallel on Kaggle, DistributedDataParallel elsewhere
+                                  # - 'single': Force single GPU/CPU training
+                                  # - 'dataparallel': Force DataParallel (recommended for Kaggle)
+                                  # - 'distributed': Force DistributedDataParallel (recommended for local/cluster)
+        
+        "distributed_training": False,  # Bật distributed training (legacy, use training_mode instead)
+        "force_single_gpu": False,  # Set to True to force single GPU training (legacy, use training_mode='single' instead)
         "num_gpus": 2,             # Number of GPUs to use (will use min of this and available)
         "backend": "nccl",         # Backend for distributed training
         "nccl_timeout": 3600000,   # 1 hour timeout for NCCL operations (in ms)
