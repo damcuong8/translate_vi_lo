@@ -718,9 +718,10 @@ def train_model_distributed(rank, world_size, config):
                     print(f"Rank {rank}: Saved checkpoint at step {global_step} to {checkpoint_filename}")
                 
                 # Apply early stopping logic
+                actual_model = model.module if isinstance(model, (DP, DataParallelTransformer)) else model
                 best_metric_value, patience_counter, should_stop = _apply_early_stopping(
                     config, metrics, best_metric_value, patience_counter, global_step,
-                    model.module, optimizer, scheduler, epoch
+                    actual_model, optimizer, scheduler, epoch
                 )
         
         # Calculate average training loss for this epoch
@@ -783,9 +784,10 @@ def train_model_distributed(rank, world_size, config):
                 print(f"Epoch {epoch}: Only saving best models (save_only_best=True)")
             
             # Apply early stopping logic
-            should_stop = _apply_early_stopping(
+            actual_model = model.module if isinstance(model, (DP, DataParallelTransformer)) else model
+            best_metric_value, patience_counter, should_stop = _apply_early_stopping(
                 config, metrics, best_metric_value, patience_counter, global_step,
-                model.module, optimizer, scheduler, epoch
+                actual_model, optimizer, scheduler, epoch
             )
             
             if should_stop:
@@ -876,6 +878,42 @@ def _apply_early_stopping(config, metrics, best_metric_value, patience_counter, 
     
     return best_metric_value, patience_counter, should_stop
 
+class DataParallelTransformer(DP):
+    """
+    Custom DataParallel wrapper for Transformer model that properly handles
+    custom methods like encode, decode, and project
+    """
+    def encode(self, src, src_mask):
+        # For encode, we can use the standard DataParallel forward mechanism
+        # by temporarily replacing the forward method
+        original_forward = self.module.forward
+        self.module.forward = self.module.encode
+        try:
+            result = super().forward(src, src_mask)
+        finally:
+            self.module.forward = original_forward
+        return result
+    
+    def decode(self, encoder_output, src_mask, tgt, tgt_mask):
+        # For decode, we use the same approach
+        original_forward = self.module.forward
+        self.module.forward = self.module.decode
+        try:
+            result = super().forward(encoder_output, src_mask, tgt, tgt_mask)
+        finally:
+            self.module.forward = original_forward
+        return result
+    
+    def project(self, x):
+        # For project, we use the same approach
+        original_forward = self.module.forward
+        self.module.forward = self.module.project
+        try:
+            result = super().forward(x)
+        finally:
+            self.module.forward = original_forward
+        return result
+
 def train_model_dataparallel(config, device_ids=None):
     """Train model using DataParallel on multiple GPUs
     
@@ -907,8 +945,8 @@ def train_model_dataparallel(config, device_ids=None):
     
     # Wrap model in DataParallel
     if len(device_ids) > 1:
-        model = DP(model, device_ids=device_ids)
-        print(f"Model wrapped in DataParallel with devices: {device_ids}")
+        model = DataParallelTransformer(model, device_ids=device_ids)
+        print(f"Model wrapped in DataParallelTransformer with devices: {device_ids}")
     else:
         print("Only one GPU specified, using single GPU training")
     
@@ -937,7 +975,7 @@ def train_model_dataparallel(config, device_ids=None):
         state = torch.load(model_filename, map_location=device)
         
         # Handle loading state dict for DataParallel models
-        if isinstance(model, DP):
+        if isinstance(model, (DP, DataParallelTransformer)):
             # If the saved model was not DataParallel, we need to load into model.module
             if any(key.startswith('module.') for key in state['model_state_dict'].keys()):
                 model.load_state_dict(state['model_state_dict'])
@@ -1133,7 +1171,7 @@ def train_model_dataparallel(config, device_ids=None):
                 model.train()  # Switch back to train mode
                 
                 # Check for best model and apply early stopping logic
-                actual_model = model.module if isinstance(model, DP) else model
+                actual_model = model.module if isinstance(model, (DP, DataParallelTransformer)) else model
                 best_metric_value, patience_counter, should_stop = _apply_early_stopping(
                     config, metrics, best_metric_value, patience_counter, global_step,
                     actual_model, optimizer, scheduler, epoch
@@ -1173,7 +1211,7 @@ def train_model_dataparallel(config, device_ids=None):
             if config.get('save_strategy', 'epoch') == 'epoch' and not config.get('save_only_best', False):
                 model_filename = get_weights_file_path(config, f"{epoch:02d}")
                 # Get the actual model state dict
-                actual_model = model.module if isinstance(model, DP) else model
+                actual_model = model.module if isinstance(model, (DP, DataParallelTransformer)) else model
                 torch.save({
                     'epoch': epoch,
                     'global_step': global_step,
@@ -1185,7 +1223,7 @@ def train_model_dataparallel(config, device_ids=None):
                 print(f"Saved model at epoch {epoch} to {model_filename}")
             
             # Check for best model and apply early stopping logic
-            actual_model = model.module if isinstance(model, DP) else model
+            actual_model = model.module if isinstance(model, (DP, DataParallelTransformer)) else model
             best_metric_value, patience_counter, should_stop = _apply_early_stopping(
                 config, metrics, best_metric_value, patience_counter, global_step,
                 actual_model, optimizer, scheduler, epoch
@@ -1513,9 +1551,10 @@ def train_model_single(config, device):
                 model.train()  # Switch back to train mode
                 
                 # Check for best model and apply early stopping logic
+                actual_model = model.module if isinstance(model, (DP, DataParallelTransformer)) else model
                 best_metric_value, patience_counter, should_stop = _apply_early_stopping(
                     config, metrics, best_metric_value, patience_counter, global_step,
-                    model, optimizer, scheduler, epoch
+                    actual_model, optimizer, scheduler, epoch
                 )
                 
                 if should_stop:
@@ -1549,9 +1588,10 @@ def train_model_single(config, device):
         model.train()  # Switch back to train mode
         
         # Check for best model and apply early stopping logic
+        actual_model = model.module if isinstance(model, (DP, DataParallelTransformer)) else model
         best_metric_value, patience_counter, should_stop = _apply_early_stopping(
             config, metrics, best_metric_value, patience_counter, global_step,
-            model, optimizer, scheduler, epoch
+            actual_model, optimizer, scheduler, epoch
         )
         
         if should_stop:
