@@ -373,6 +373,25 @@ def get_autocast_context(use_mixed_precision=False):
         from contextlib import nullcontext
         return nullcontext()
 
+def monitor_gpu_usage():
+    """Monitor and print GPU usage for all available GPUs"""
+    if not torch.cuda.is_available():
+        return "No CUDA GPUs available"
+    
+    gpu_info = []
+    for i in range(torch.cuda.device_count()):
+        # Get memory info
+        memory_allocated = torch.cuda.memory_allocated(i) / 1024**3  # GB
+        memory_reserved = torch.cuda.memory_reserved(i) / 1024**3   # GB
+        memory_total = torch.cuda.get_device_properties(i).total_memory / 1024**3  # GB
+        
+        # Get utilization (this requires nvidia-ml-py or similar, so we'll use memory as proxy)
+        utilization = (memory_allocated / memory_total) * 100 if memory_total > 0 else 0
+        
+        gpu_info.append(f"GPU {i}: {memory_allocated:.1f}GB/{memory_total:.1f}GB ({utilization:.1f}%)")
+    
+    return " | ".join(gpu_info)
+
 def log_to_tensorboard(writer, tag, value, step, flush=False):
     """Helper function to consistently log metrics to TensorBoard
     
@@ -609,9 +628,11 @@ def train_model_distributed(rank, world_size, config):
 
             # Forward pass with autocast for mixed precision
             with amp_context:
-                encoder_output = model.module.encode(encoder_input, encoder_mask)
-                decoder_output = model.module.decode(encoder_output, encoder_mask, decoder_input, decoder_mask)
-                proj_output = model.module.project(decoder_output)
+                # For DataParallel, call the model directly - DO NOT use model.module
+                # DataParallel will automatically handle splitting across GPUs
+                encoder_output = model.encode(encoder_input, encoder_mask)
+                decoder_output = model.decode(encoder_output, encoder_mask, decoder_input, decoder_mask)
+                proj_output = model.project(decoder_output)
                 
                 # Compute loss
                 loss = loss_fn(proj_output.view(-1, tokenizer_tgt.vocab_size()), label.view(-1)) * loss_factor
@@ -660,6 +681,11 @@ def train_model_distributed(rank, world_size, config):
             if rank == 0 and writer is not None:
                 log_to_tensorboard(writer, 'train/loss', full_loss, global_step)
                 log_to_tensorboard(writer, 'train/learning_rate', scheduler.get_last_lr()[0], global_step, flush=True)
+            
+            # Monitor GPU usage every 50 batches
+            if batch_count % 50 == 0:
+                gpu_usage = monitor_gpu_usage()
+                print(f"Batch {batch_count} - {gpu_usage}")
             
             global_step += 1
             
@@ -1025,15 +1051,11 @@ def train_model_dataparallel(config, device_ids=None):
             
             # Forward pass with autocast for mixed precision
             with amp_context:
-                # Handle DataParallel model access
-                if isinstance(model, DP):
-                    encoder_output = model.module.encode(encoder_input, encoder_mask)
-                    decoder_output = model.module.decode(encoder_output, encoder_mask, decoder_input, decoder_mask)
-                    proj_output = model.module.project(decoder_output)
-                else:
-                    encoder_output = model.encode(encoder_input, encoder_mask)
-                    decoder_output = model.decode(encoder_output, encoder_mask, decoder_input, decoder_mask)
-                    proj_output = model.project(decoder_output)
+                # For DataParallel, call the model directly - DO NOT use model.module
+                # DataParallel will automatically handle splitting across GPUs
+                encoder_output = model.encode(encoder_input, encoder_mask)
+                decoder_output = model.decode(encoder_output, encoder_mask, decoder_input, decoder_mask)
+                proj_output = model.project(decoder_output)
                 
                 # Compute loss
                 loss = loss_fn(proj_output.view(-1, tokenizer_tgt.vocab_size()), label.view(-1)) * loss_factor
@@ -1080,6 +1102,11 @@ def train_model_dataparallel(config, device_ids=None):
             # Log metrics
             log_to_tensorboard(writer, 'train/loss', full_loss, global_step)
             log_to_tensorboard(writer, 'train/learning_rate', scheduler.get_last_lr()[0], global_step, flush=True)
+            
+            # Monitor GPU usage every 50 batches
+            if batch_count % 50 == 0:
+                gpu_usage = monitor_gpu_usage()
+                print(f"Batch {batch_count} - {gpu_usage}")
             
             global_step += 1
             
@@ -1454,6 +1481,11 @@ def train_model_single(config, device):
             # Log metrics
             log_to_tensorboard(writer, 'train/loss', full_loss, global_step)
             log_to_tensorboard(writer, 'train/learning_rate', scheduler.get_last_lr()[0], global_step, flush=True)
+            
+            # Monitor GPU usage every 50 batches
+            if batch_count % 50 == 0:
+                gpu_usage = monitor_gpu_usage()
+                print(f"Batch {batch_count} - {gpu_usage}")
             
             global_step += 1
             

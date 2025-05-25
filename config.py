@@ -4,7 +4,9 @@ import torch
 
 def get_config():
     return {
-        "batch_size": 16,  # Batch size per GPU
+        "batch_size": 16,  # Batch size per GPU - IMPORTANT: This is the TOTAL batch size, will be split across GPUs
+                          # With 2 GPUs: each GPU gets batch_size/2 = 8 samples
+                          # Minimum recommended: 4 (so each GPU gets at least 2 samples)
         "num_epochs": 100,
         "lr": 5e-4,
         "max_len": 500,
@@ -95,3 +97,35 @@ def latest_weights_file_path(config):
         return None
     weights_files.sort()
     return str(weights_files[-1])
+
+def get_kaggle_config():
+    """Configuration optimized for Kaggle DataParallel training"""
+    config = get_config()
+    config.update({
+        # Optimized for Kaggle's 2-GPU setup
+        "batch_size": 8,           # Total batch size (4 per GPU)
+        "gradient_accumulation_steps": 2,  # Effective batch = 8 * 2 = 16
+        "training_mode": "dataparallel",   # Force DataParallel
+        "num_gpus": 2,
+        
+        # Smaller model for Kaggle memory constraints
+        "d_model": 384,
+        "num_layers": 4,
+        "d_ff": 1536,
+        "max_len": 350,
+        
+        # Faster iteration
+        "num_epochs": 50,
+        "early_stopping_patience": 5,
+        "warmup_steps": 2000,
+        
+        # Kaggle paths (update these for your dataset)
+        "tokenizer_src_path": "/kaggle/input/your-dataset/tokenizer_vi.model",
+        "tokenizer_tgt_path": "/kaggle/input/your-dataset/tokenizer_lo.model",
+        "train_src_file": "/kaggle/input/your-dataset/vi-lo.train.vi",
+        "train_tgt_file": "/kaggle/input/your-dataset/vi-lo.train.lo",
+        "val_src_file": "/kaggle/input/your-dataset/vi-lo.dev.vi",
+        "val_tgt_file": "/kaggle/input/your-dataset/vi-lo.dev.lo",
+        "experiment_name": "runs/vi_lo_model_kaggle"
+    })
+    return config
